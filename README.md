@@ -69,6 +69,31 @@ For GLM-5.3 that number is the whole story so far: **19.66 tok/s on one Spark** 
 SGLang NVFP4 figure of 24.7-30.3 tok/s on two, so llama.cpp on one node is already in the same range
 as the other engine on two.
 
+## Two nodes
+
+The two-node path works. `llama-bench --rpc <peer>:50052` brings the model up with backend `CUDA,RPC`
+and the link negotiates RDMA over RoCE:
+
+```
+RDMA probed:    dev=rocep1s0f1 gid=5 RoCEv2 qpn=10958 inline=316
+RDMA activated: qpn=10958->38484 mtu=4096 rx_depth=24
+```
+
+At identical flags (`-p 128 -n 32 -r 1`) it currently buys nothing:
+
+| | pp128 | tg32 |
+|---|---|---|
+| one node, `CUDA` | 162.07 | 16.43 |
+| two nodes, `CUDA,RPC` | 167.33 | 16.94 |
+
+That is the honest state: a working mechanism, not yet a faster one. The model already fits on one
+node (86.7 GiB of 121), so the layer split only adds per-layer RPC latency; making it pay needs a real
+split strategy rather than the default, which is the point of the remaining two-node work.
+
+**Benchmark caveat, new:** the same model and machine gives `tg64 19.66` but `tg32 16.43`, so the
+generation length moves the number by about 20 % here. Compare only at identical `-p`/`-n`.
+
+
 ## Not in this repo
 
 - **GLM-5-Next support**, which is upstream PR #27754 (Unsloth), not ours. We build with it merged

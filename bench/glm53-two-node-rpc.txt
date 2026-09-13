@@ -1,0 +1,13 @@
+953525 /home/maci/llamacpp-nccl/build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052
+1
+=== launching the GLM two-node run (RPC) in the background ===
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 124610 MiB):
+  Device 0: NVIDIA GB10, compute capability 12.1, VMM: yes, VRAM: 124610 MiB
+RDMA probed: dev=rocep1s0f1 gid=5 RoCEv2 qpn=10958 inline=316
+RDMA activated: qpn=10958->38484 mtu=4096 rx_depth=24
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| glm5next 313B.A17B IQ1_S - 1.5625 bpw |  86.69 GiB |   320.76 B | CUDA,RPC   |  99 |           pp128 |        167.33 ± 0.00 |
+| glm5next 313B.A17B IQ1_S - 1.5625 bpw |  86.69 GiB |   320.76 B | CUDA,RPC   |  99 |            tg32 |         16.94 ± 0.00 |
+
+build: unknown (0)
