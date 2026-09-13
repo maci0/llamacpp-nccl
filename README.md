@@ -9,7 +9,7 @@ The goal for this work: on this rig, for three models, be faster than the other 
 | target | llama.cpp surface | bar to beat | state |
 |---|---|---|---|
 | `qwen3.8-flash-next` | `src/models/qwen4exp.cpp`, `conversion/qwen4exp.py` | vLLM TP2: 31.14 tok/s single-stream, **74.28 tok/s aggregate at 8 concurrent**; SGLang ~21 tok/s | single-Spark GGUF works; **measured 27.05 tok/s generation** (see `bench/`) |
-| `deepseek-v4-flash-0731` | two-node NCCL/RPC: `tools/rpc/rpc-server.cpp`, `ggml/src/ggml-rpc/ggml-rpc.cpp`, `common/speculative.*`, `src/models/deepseek4.cpp`, `src/models/dflash.cpp` | vLLM on this rig: 63.1 / 112.1 / 140.9 / 156.0 tok/s at c1/c3/c5/c6 | in the patches below; needs the 145 GB GGUF over two nodes |
+| `deepseek-v4-flash-0731` | two-node NCCL/RPC: `tools/rpc/rpc-server.cpp`, `ggml/src/ggml-rpc/ggml-rpc.cpp`, `common/speculative.*`, `src/models/deepseek4.cpp`, `src/models/dflash.cpp` | vLLM on this rig, with DSpark spec decode: 63.1 / 112.1 / 140.9 / 156.0 tok/s at c1/c3/c5/c6 | **runs two-node over RPC: pp64 158.56, tg32 16.59 t/s** (MXFP4, 144.44 GiB, 284.33B params) |
 | `glm5.3-flash` | none of ours: upstream PR [ggml-org/llama.cpp#27754](https://github.com/ggml-org/llama.cpp/pull/27754) adds the `glm5next` arch | SGLang day-0 NVFP4 TP2: 24.7-30.3 tok/s on two Sparks | **runs: 19.66 tok/s on one Spark** (IQ1_S) |
 
 So the honest position: single-Spark llama.cpp already matches vLLM one-to-one and is far behind it
@@ -89,6 +89,21 @@ At identical flags (`-p 128 -n 32 -r 1`) it currently buys nothing:
 That is the honest state: a working mechanism, not yet a faster one. The model already fits on one
 node (86.7 GiB of 121), so the layer split only adds per-layer RPC latency; making it pay needs a real
 split strategy rather than the default, which is the point of the remaining two-node work.
+
+### The case the two-node path exists for
+
+DeepSeek-V4-Flash does **not** fit one Spark: MXFP4, 144.44 GiB, 284.33B params. It runs across the
+pair:
+
+```
+deepseek4 ?B MXFP4 MoE | 144.44 GiB | 284.33 B | CUDA,RPC | ngl 99
+  pp64   158.56 t/s
+  tg32    16.59 t/s        (one pass, 2026-09-13, RDMA negotiated qpn=10968->38494)
+```
+
+Against vLLM on the same rig, which serves this model with DSpark speculative decoding at 63.1 tok/s
+at c1 and 156.0 at c6, that is a large gap, and it is the honest floor: no speculative decoding here,
+and a layer split over RPC rather than real tensor parallelism. Closing it is the work.
 
 **Benchmark caveat, new:** the same model and machine gives `tg64 19.66` but `tg32 16.43`, so the
 generation length moves the number by about 20 % here. Compare only at identical `-p`/`-n`.
