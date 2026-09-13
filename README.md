@@ -26,6 +26,7 @@ the patches apply to. They were also merged onto current master (`790cf51aa`) an
 patches/    our commits, in order, each a normal git patch with authorship
 scripts/    start_rpc_spark.sh, run_qwen38_tp2.sh, build_spark.sh
 docs/       targets.md - the three-model mission, bars and blockers
+            upstream.md - the PRs we depend on or watch, with their state
 bench/      raw llama-bench output, with the machine and flags
 ```
 
