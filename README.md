@@ -35,6 +35,7 @@ bench/      raw llama-bench output, with the machine and flags
 | `0002` | the accumulated work: two-node NCCL/RPC transport, DFlash2 draft plumbing, Qwen4Exp model and converter, and the three scripts |
 | `0003` | the workspace scope note and the three-model target docs |
 | `0004` | the Qwen4Exp line-reconciliation record |
+| `0005` | ggml-cuda: single-token MMVQ dispatch optimization (our PR work, RDNA3 path) |
 
 ## Applying and building
 
