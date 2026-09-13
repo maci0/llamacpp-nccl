@@ -1,10 +1,23 @@
+Two GB10 over ggml-rpc-server (backend CUDA,RPC), peer 10.0.1.2:50052, RDMA over RoCE.
+Model: DeepSeek-V4-Flash-0731 UD-Q4_K_XL (unsloth), 5 shards, 144.44 GiB, 284.33 B params,
+-ngl 99. This does not fit one Spark (124.6 GiB), so the pair is the only option.
+
+--- 2026-09-13, -p 64 -n 32 -r 3 ---
+
 ggml_cuda_init: found 1 CUDA devices (Total VRAM: 124610 MiB):
   Device 0: NVIDIA GB10, compute capability 12.1, VMM: yes, VRAM: 124610 MiB
-RDMA probed: dev=rocep1s0f1 gid=5 RoCEv2 qpn=10968 inline=316
-RDMA activated: qpn=10968->38494 mtu=4096 rx_depth=24
+RDMA probed: dev=rocep1s0f1 gid=5 RoCEv2 qpn=11029 inline=316
+RDMA activated: qpn=11029->38555 mtu=4096 rx_depth=24
 | model                          |       size |     params | backend    | ngl |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
-| deepseek4 ?B MXFP4 MoE         | 144.44 GiB |   284.33 B | CUDA,RPC   |  99 |            pp64 |        158.56 ± 0.00 |
-| deepseek4 ?B MXFP4 MoE         | 144.44 GiB |   284.33 B | CUDA,RPC   |  99 |            tg32 |         16.59 ± 0.00 |
+| deepseek4 ?B MXFP4 MoE         | 144.44 GiB |   284.33 B | CUDA,RPC   |  99 |            pp64 |        164.02 ± 9.34 |
+| deepseek4 ?B MXFP4 MoE         | 144.44 GiB |   284.33 B | CUDA,RPC   |  99 |            tg32 |         15.08 ± 1.13 |
 
 build: unknown (0)
+
+An earlier single-rep run of the same configuration recorded `pp64 158.56 / tg32 16.59`. The 3-rep
+median is lower on generation, so 15.08 +- 1.13 is the number to quote.
+
+The bar: vLLM on this rig, serving this model with DSpark speculative decoding, does 63.1 / 112.1 /
+140.9 / 156.0 tok/s at c1/c3/c5/c6. This run has no speculative decoding and splits layers over RPC
+rather than using tensor parallelism, which is where the gap comes from.

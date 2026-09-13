@@ -1,3 +1,20 @@
+One GB10 (DGX Spark, sm_121), our build from patches/ applied to upstream 304665fe7.
+Model: GLM-5.3-Flash-UD-IQ1_S (unsloth), 3 shards, 86.69 GiB, 320.76 B params.
+All runs -ngl 99, no RPC server active on the peer.
+
+--- 2026-09-13, -p 128 -n 32 -r 3 (this is the comparable run) ---
+
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 124610 MiB):
+  Device 0: NVIDIA GB10, compute capability 12.1, VMM: yes, VRAM: 124610 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| glm5next 313B.A17B IQ1_S - 1.5625 bpw |  86.69 GiB |   320.76 B | CUDA       |  99 |           pp128 |        166.59 ± 4.93 |
+| glm5next 313B.A17B IQ1_S - 1.5625 bpw |  86.69 GiB |   320.76 B | CUDA       |  99 |            tg32 |         19.74 ± 0.12 |
+
+build: unknown (0)
+
+--- 2026-09-13, -p 256 -n 64 -r 1 (first run of the day) ---
+
 ggml_cuda_init: found 1 CUDA devices (Total VRAM: 124610 MiB):
   Device 0: NVIDIA GB10, compute capability 12.1, VMM: yes, VRAM: 124610 MiB
 | model                          |       size |     params | backend    | ngl |            test |                  t/s |
@@ -6,3 +23,7 @@ ggml_cuda_init: found 1 CUDA devices (Total VRAM: 124610 MiB):
 | glm5next 313B.A17B IQ1_S - 1.5625 bpw |  86.69 GiB |   320.76 B | CUDA       |  99 |            tg64 |         19.66 ± 0.00 |
 
 build: unknown (0)
+
+Note: `tg64` and `tg32` agree (19.66 vs 19.74). An earlier single-rep run in this
+workspace recorded `tg32 16.43`; that does not reproduce and was almost certainly taken
+while another llama-bench process held the same GPU.

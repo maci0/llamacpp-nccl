@@ -1,0 +1,24 @@
+What the two-node GLM run actually does with the model. Both runs are
+`llama-bench -m <glm shard 1> -ngl 99 --rpc 10.0.1.2:50052 -p 8 -n 8 -r 1 -v`.
+
+### default layer split
+
+load_tensors: offloaded 47/47 layers to GPU
+load_tensors:          CPU model buffer size =     0.00 MiB
+load_tensors:        CUDA0 model buffer size = 42286.33 MiB
+load_tensors:    CUDA_Host model buffer size =   340.31 MiB
+load_tensors: RPC0[10.0.1.2:50052] model buffer size = 43480.40 MiB
+llama_kv_cache:      CUDA0 KV buffer size =     1.25 MiB
+llama_kv_cache: RPC0[10.0.1.2:50052] KV buffer size =     1.50 MiB
+sched_reserve: graph splits = 5
+
+### -ts 1/1
+
+load_tensors:          CPU model buffer size =     0.00 MiB
+load_tensors:        CUDA0 model buffer size = 42286.33 MiB
+load_tensors:    CUDA_Host model buffer size =   340.31 MiB
+load_tensors: RPC0[10.0.1.2:50052] model buffer size = 43480.40 MiB
+
+The two are byte-identical. The default split is already 49.3 % / 50.7 % of the weights, so
+there is no "the default left everything on one node" defect to fix here: the split is even
+and the two-node result is what an even layer split over this link costs.
