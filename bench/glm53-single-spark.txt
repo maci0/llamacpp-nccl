@@ -1,0 +1,8 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 124610 MiB):
+  Device 0: NVIDIA GB10, compute capability 12.1, VMM: yes, VRAM: 124610 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| glm5next 313B.A17B IQ1_S - 1.5625 bpw |  86.69 GiB |   320.76 B | CUDA       |  99 |           pp256 |        240.61 ± 0.00 |
+| glm5next 313B.A17B IQ1_S - 1.5625 bpw |  86.69 GiB |   320.76 B | CUDA       |  99 |            tg64 |         19.66 ± 0.00 |
+
+build: unknown (0)
