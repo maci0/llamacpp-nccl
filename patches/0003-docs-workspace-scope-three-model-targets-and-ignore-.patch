@@ -1,0 +1,1242 @@
+From d7dfda99a52c027b167ae2e34bbb5c1a0a56692b Mon Sep 17 00:00:00 2001
+From: "Marcel W. Wysocki" <maci.stgn@gmail.com>
+Date: Sun, 13 Sep 2026 11:36:09 +0800
+Subject: [PATCH 3/4] docs: workspace scope, three-model targets and ignore
+ local scratch
+
+AGENTS.md states that this checkout is llama.cpp only and that the vLLM work lives in the sibling vllm-spark-0731 project.
+
+docs/targets/ frames the three benchmark targets (deepseek-v4-flash-0731, glm5.3-flash, qwen3.8-flash-next) with the llama.cpp surface for each, the measured bars to beat, and the consolidation state. The GLM-5.3 feasibility note comes from a repo with no remote, and the Qwen3.8 docs from maci0/qwen3.8-flash-next-spark.
+
+.scratch/ is now ignored, as the workspace convention expects.
+
+Assisted-by: Kimi Code
+---
+ .gitignore                                    |   4 +
+ AGENTS.md                                     |   9 +
+ docs/targets/README.md                        |  73 ++++
+ docs/targets/glm5.3-flash/FEASIBILITY.md      |  80 ++++
+ .../qwen3.8-flash-next/README-upstream.md     |  84 ++++
+ docs/targets/qwen3.8-flash-next/plan.md       | 115 ++++++
+ docs/targets/qwen3.8-flash-next/research.md   | 123 ++++++
+ .../targets/qwen3.8-flash-next/session-log.md | 362 ++++++++++++++++++
+ .../qwen3.8-flash-next/sglang-deployment.md   | 101 +++++
+ .../targets/qwen3.8-flash-next/sglang-perf.md | 103 +++++
+ docs/targets/qwen3.8-flash-next/vllm-perf.md  |  77 ++++
+ 11 files changed, 1131 insertions(+)
+ create mode 100644 docs/targets/README.md
+ create mode 100644 docs/targets/glm5.3-flash/FEASIBILITY.md
+ create mode 100644 docs/targets/qwen3.8-flash-next/README-upstream.md
+ create mode 100644 docs/targets/qwen3.8-flash-next/plan.md
+ create mode 100644 docs/targets/qwen3.8-flash-next/research.md
+ create mode 100644 docs/targets/qwen3.8-flash-next/session-log.md
+ create mode 100644 docs/targets/qwen3.8-flash-next/sglang-deployment.md
+ create mode 100644 docs/targets/qwen3.8-flash-next/sglang-perf.md
+ create mode 100644 docs/targets/qwen3.8-flash-next/vllm-perf.md
+
+diff --git a/.gitignore b/.gitignore
+index 9b589615a..7228e442f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -153,3 +153,7 @@ a.out.*
+ 
+ AGENTS.local.md
+ .pi/SYSTEM.md
++
++# Local workspace scratch
++
++/.scratch/
+diff --git a/AGENTS.md b/AGENTS.md
+index 6d83a02f4..cdee5d21e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,5 +1,14 @@
+ # Instructions for llama.cpp
+ 
++> [!NOTE]
++> **Workspace scope: llama.cpp only.** The vLLM work for DeepSeek-V4-Flash-0731 on the DGX Spark
++> pair (the proto and main-029 images, b12x, DSpark, the `nvfp4_ds_mla` KV cache, the measurement
++> harness) lives in `/home/maci/Desktop/vllm-spark-0731` and on `spark1:~/vllm-spark-0731`. Keep
++> vLLM scratch, logs, recipes and notes there, never in this tree's `.scratch/`. Anything vLLM that
++> used to be here has been migrated to `vllm-spark-0731/.scratch/imported-from-llamacpp/`. spark1
++> and spark2 are shared between the two projects, so do not stop the other project's containers or
++> remove its images while working here.
++
+ > [!IMPORTANT]
+ >
+ > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
+diff --git a/docs/targets/README.md b/docs/targets/README.md
+new file mode 100644
+index 000000000..14def6996
+--- /dev/null
++++ b/docs/targets/README.md
+@@ -0,0 +1,73 @@
++# Targets
++
++This repo is the llama.cpp home for the DGX Spark performance work. The mission is to beat vLLM,
++SGLang and the other engines on the same rig for three models:
++
++| # | Model | llama.cpp surface here | The bar to beat | State |
++|---|---|---|---|---|
++| 1 | `deepseek-v4-flash-0731` | two-node NCCL/RPC: `tools/rpc/rpc-server.cpp`, `ggml/src/ggml-rpc/ggml-rpc.cpp`, `common/speculative.*`, `src/models/deepseek4.cpp`, `src/models/dflash.cpp` | vLLM on the same 2 Sparks, guarded, c1/c3/c5/c6 = 63.1 / 112.1 / 140.9 / 156.0 tok/s (the anemll reference), our own vLLM 42.0 / 79.3 / 109.1 / 122.8 | work in the working tree, uncommitted |
++| 2 | `glm5.3-flash` | `src/models/glm-dsa.cpp` (`llama_model_glm_dsa`, handles GLM 5 / 5.1 / 5.2 indexer types) | nothing measured yet | feasibility research only |
++| 3 | `qwen3.8-flash-next` | `src/models/qwen4exp.cpp`, `conversion/qwen4exp.py`; GGUF MTP serving | vLLM TP2 on the same 2 Sparks: 31.14 tok/s single-stream, **74.28 tok/s aggregate at 8 concurrent**; SGLang ~21 tok/s. Our own llama.cpp bar: single-Spark GGUF MTP 4-bit, ~27 to 32 tok/s | GGUF single-Spark serving DONE; 2-node is the open job |
++
++Read the goal as: for each model, make llama.cpp on this rig faster than the best other engine, measured
++the same way. The vLLM numbers above come from the vLLM project's guarded protocol (`drive-median.sh
++<tag> 3 512 1 3 5 6`, chat, seed 1234, three passes, median), which lives in the sibling project, not
++here.
++
++## Per target
++
++### 1. deepseek-v4-flash-0731
++
++Two-node tensor parallelism over NCCL/RPC is the work. What exists:
++
++- the working tree here, uncommitted, 21 files including the RPC server and the ggml-rpc transport;
++- `scripts/start_rpc_spark.sh`, untracked;
++- the vLLM numbers above, which are the bar, and the vLLM project for context.
++
++### 2. glm5.3-flash
++
++Released 2026-08-26, so the research is day-0/1 and the source notes flag unverified claims as such.
++320B total / 18B active, 45 layers, hybrid 34 KDA linear-attention + 11 NoPE sparse-MLA layers, MLA KV
++(`kv_lora_rank` 512), 1M native context, one MTP draft layer, multimodal.
++
++Source notes: [`glm5.3-flash/FEASIBILITY.md`](glm5.3-flash/FEASIBILITY.md). Nothing has been measured
++on this rig for this model yet, so the first step is a served baseline rather than an optimisation.
++
++### 3. qwen3.8-flash-next
++
++The furthest along of the three. llama.cpp GGUF MTP on one Spark is already serving and is the bar for
++the 2-node work; vLLM TP2 reaches 74.28 tok/s aggregate at 8 concurrent, which single-Spark llama.cpp
++does not.
++
++Source notes, verbatim from the public repo `maci0/qwen3.8-flash-next-spark`:
++[`qwen3.8-flash-next/`](qwen3.8-flash-next/) — `plan.md` (Plan A SGLang TP2 done, **Plan B GGUF 4-bit
++llama.cpp done, single Spark**), `research.md`, `session-log.md`, `vllm-perf.md`, `sglang-perf.md`,
++`sglang-deployment.md`, plus the repo README as `README-upstream.md`.
++
++## Consolidation status
++
++Captured here on 2026-09-13:
++
++- **the Spark-only Qwen4Exp history**, fetched as `refs/remotes/spark-qwen38/*`. Branch `pr-27742`
++  holds **33 feature commits this repo had never seen**, including `qwen4exp: double the Q split
++  granularity for tensor parallelism`, the fused-QKV segmentation for tensor split, the indexer cache
++  tensor names, and a quantized-KV path in QSA. They were unpushed and existed only on spark1.
++- the GLM feasibility note (its repo is local-only and unpushed) and the Qwen3.8 docs above.
++
++Still to do, in order:
++
++1. **Reconcile the two Qwen4Exp lines.** `spark-qwen38/pr-27742` and this repo's uncommitted tree are
++   different revisions of the same model work, and they sit on different upstream masters (the Spark
++   fork point is older). This is a rebase or cherry-pick job, not a copy.
++2. **Commit what is uncommitted here.** The two-node NCCL work and the Qwen4Exp changes are in the
++   working tree, so one `git checkout` loses them. There is no push remote for this work yet; the
++   only remote is upstream `ggml-org/llama.cpp`.
++3. Measure a baseline per target on this rig using a single protocol for all three.
++
++## Provenance
++
++| Source | How it got here |
++|---|---|
++| `spark1:~/qwen3.8-flash-next/llama.cpp` branches | `git bundle --branches` in that clone, fetched into `refs/remotes/spark-qwen38/*`. The objects, including file contents, are now in this repo's object store, so the 374 MB bundle was not kept: re-create it with `git bundle create <file> --branches` in that clone if it is ever needed again |
++| `/home/maci/Desktop/glm-5.3-flash/README.md` | copied verbatim to `glm5.3-flash/FEASIBILITY.md`; that repo has no remote, so this is now the second copy |
++| `/home/maci/Desktop/qwen3.8-flash-next-spark/` | `docs/` copied verbatim; the public repo remains the upstream home, so refresh from there rather than editing in place |
+diff --git a/docs/targets/glm5.3-flash/FEASIBILITY.md b/docs/targets/glm5.3-flash/FEASIBILITY.md
+new file mode 100644
+index 000000000..37d3627f8
+--- /dev/null
++++ b/docs/targets/glm5.3-flash/FEASIBILITY.md
+@@ -0,0 +1,80 @@
++# GLM-5.3-Flash on 2× DGX Spark — Feasibility
++
++Research date: 2026-08-27. GLM-5.3-Flash (codename *ox-alpha*) was released **2026-08-26** — the ecosystem is ~24–48 h old. Day-0/1 evidence; unverified facts flagged as such.
++
++## 1. Model specs
++
++| Property | Value |
++|---|---|
++| Total params | 320–321B (marketed 320B; HF/vLLM tag 321B: 311.65B routed experts + 9.67B rest) |
++| Active params | **18B** (MoE: 288 routed experts, top-8, 1 shared; first 3 of 45 layers dense) |
++| Architecture | `Glm5NextForConditionalGeneration` — hybrid: **34 KDA linear-attention + 11 NoPE sparse-MLA** (DeepSeek-sparse, KPool indexer, `index_topk=2048`, `index_kpool=4`), MLA-style KV (`kv_lora_rank=512`), mHC hyper-connections, **1 MTP draft layer** |
++| Layers / hidden | 45 layers, hidden 4096, dense inter 12288, MoE inter 2048, 64 heads |
++| Context | **1,048,576 native (1M)**; max output 128K (API). Nothing documented beyond 1M |
++| What "Flash" is | Cost/speed-optimized **open** variant of flagship GLM-5.3 (which is API-only, no weights). Flash has an internal MTP draft head for spec decode — not a draft model itself |
++| Multimodal | Yes — image + video (24-layer ViT; video via GLM-OCR-ViT; SGLang up to 240K visual tokens) |
++
++## 2. Precisions & on-disk sizes
++
++| Repo | Precision | Size |
++|---|---|---|
++| `zai-org/GLM-5.3-Flash` (default) | **FP8** (e4m3) | ~306 GiB (~328 GB) |
++| `zai-org/GLM-5.3-Flash-BF16` | BF16 | ~598.5 GiB (~642 GB) |
++| `unsloth/GLM-5.3-Flash-GGUF` | UD-IQ1_S / Q2_K_XL / IQ3_XXS / Q4_K_XL | 93.1 / 109 / 120 / 200 GB |
++| `LibertAIDAI/GLM-5.3-Flash-NVFP4` | NVFP4 (experts only; attn/vision/embeddings BF16) | ~181 GiB (~195 GB) |
++| misc | unsloth FP8, dealignai, local-inference-lab, antirez GGUF, MLX | — |
++
++## 3. Memory math (per Spark: ~121 GiB total / ~110 GiB usable after headroom)
++
++| Precision | Total | Per node @ TP2 | 2× Spark? | Single Spark? |
++|---|---|---|---|---|
++| BF16 | 642 GB | 299 GB | ❌ (needs 5×) | ❌ |
++| FP8 | 328 GB | 153 GB | ❌ (needs 4×: 76.5 GB/node) | ❌ |
++| **NVFP4** | ~195 GB | ~97 GB | ✅ tight (measured ~97 GB/node) | ❌ |
++| GGUF Q4_K_XL | 200 GB | 100 GB | ✅ tight | ❌ |
++| GGUF IQ3_XXS | 120 GB | 60 GB | ✅ comfortable | ❌ (111.8 GiB > 110) |
++| GGUF Q2_K_XL | 109 GB | 54.5 GB | ✅ | ⚠️ borderline (~8 GiB slack) |
++| GGUF IQ1_S | 93.1 GB | 46.5 GB | ✅ | ✅ (~23 GiB slack) |
++
++**KV cache is nearly free** (34/45 KDA layers = no per-token KV; 11 MLA layers ≈ 12–13 KB/token BF16 / 6.4–6.6 KB/token FP8):
++- 32K: ~0.4 GB · 128K: ~1.7 GB · **1M: ~13 GB (6.6 GB FP8)**. Not the binding constraint.
++- KDA layers carry a per-request recurrent state (~2.2 GB for 31 slots on 2× Spark, SGLang-measured).
++
++**GB10 overheads (community-measured):** CUDA runtime/activations ~3–8 GB; after ~97 GB of NVFP4 weights at TP2 the driver only reliably grants ~4.5 GiB KV; page cache competes with GPU allocations during load (use a cache-flusher sidecar); vLLM's multimodal front-end OOMs the 121 GB box → `--language-model-only` required on 2× Spark.
++
++## 4. Runtime support on sm_121 (GB10)
++
++| Engine | Status | Notes / evidence |
++|---|---|---|
++| **SGLang** | ✅ **only fully-verified path** | Official recipe on **2× GB10 TP2** (`lmsysorg/sglang:glm-5.3-flash-arm64`), merged PR [#36507](https://github.com/sgl-project/sglang/issues/36507). Needs `--attention-backend dsa --dsa-*-backend tilelang --kv-cache-dtype bfloat16 --moe-runner-backend flashinfer_cutlass --disable-shared-experts-fusion` + TileLang smem patch (GB10 caps 101,376 B smem). |
++| **vLLM** | ⚠️ community mods only | `glm5_next` not in main (PR [#53906](https://github.com/vllm-project/vllm/pull/53906) open; v0.28.0 lacks it) — use per-model images `vllm/vllm-openai:glm53-flash-arm64-cu130`. Vendor-verified H100/B200/GB200 only; stock image fails on GB10 (FlashInfer 0-RoPE sparse-MLA: "Unsupported architecture"). Community fix: NoPE zero-pad mod + `--moe-backend marlin` → **24.7–30.3 t/s TP2 MTP-5, 262K ctx** (43.4 t/s peak elsewhere); TP4 needs an 8-patch stack. |
++| **llama.cpp** | ✅ arch supported, unmerged | Unsloth PR [#27754](https://github.com/ggml-org/llama.cpp/pull/27754) (KDA+DSA+kpool+mHC+MoE+vision); use `unslothai/llama.cpp` `glm5next/upstream` branch / Unsloth Desktop. GGUF quants 93–200 GB. **No published sm_121 throughput numbers.** |
++| TokenSpeed / KTransformers | listed by Z.ai | no Spark evidence — unknown |
++
++FP8/FP4 on GB10: sm_121 has FP8+FP4 tensor cores; NVFP4 weight-only works (vLLM marlin int4; SGLang flashinfer_cutlass); community unlocked FP8-e4m3 KV on sm_121. **No official NVIDIA playbook entry and no NIM** for GLM-5.3-Flash yet.
++
++## 5. Precedents
++
++- **GLM-5.3-Flash day-0 on 2× Spark**: 24.7 code / 30.3 structured / 19.6 prose t/s (MTP-5, TP2) — [NVIDIA forum](https://forums.developer.nvidia.com/t/glm-5-3-flash-running-on-2x-dgx-spark-sm-121-day-0-24-7-30-3-tok-s-with-mtp-5-two-silent-gb10-gotchas-worth-knowing/381433); 43.4 t/s peak — [forum](https://forums.developer.nvidia.com/t/glm-5-3-flash-on-2x-nvidia-dgx-spark-43-4-tok-s-peak-checkpoint/381429); TP4/1M on 4× Spark 35.7–63.8 t/s — [tonyd2wild](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark).
++- GLM-4.7 (355B NVFP4) on 2× Spark, 64K, ~17.5 t/s vLLM TP2 — [level1techs](https://forum.level1techs.com/t/full-glm-4-7-355b-nvfp4-at-64k-on-two-dgx-sparks-working-recipe/252212).
++- GLM-5.2 (753B) on 4× Spark, 1M ctx, ~24.7 t/s — [bird/GLM-spark](https://github.com/bird/GLM-spark).
++- Unsloth: 1-bit needs 100 GB, 3-bit needs 128 GB devices ("like a Mac or DGX Spark") — [unsloth](https://unsloth.ai/docs/models/glm-5.3-flash).
++
++## 6. Bottom line
++
++- **2× DGX Spark (TP2): YES** — NVFP4 (~97 GB/node, measured) or GGUF Q4_K_XL (100 GB/node); IQ3/Q2/IQ1 more comfortable. Proven day-0 at 24.7–30.3 t/s (262K ctx). Binding constraint: **per-node memory** → 4-bit-class weights mandatory (FP8 needs 4× Spark).
++- **Single Spark: NO for useful quality** — only 1-bit IQ1_S (93 GB) fits with headroom (retains ~71% of top-1% accuracy per Unsloth).
++- Engine maturity: SGLang tilelang is the only cleanly-verified sm_121 path; vLLM needs community mods and loses multimodal on 2× Spark; llama.cpp is unmerged-PR territory.
++- **Conflict with Qwen Plan A**: GLM TP2 occupies both Sparks — mutually exclusive with the Qwen SGLang NVFP4 TP2 plan; can coexist with the single-Spark Qwen GGUF server only by dedicating one Spark per model.
++
++## 7. Sources
++
++- [zai-org/GLM-5.3-Flash model card](https://huggingface.co/zai-org/GLM-5.3-Flash) · [config.json](https://huggingface.co/zai-org/GLM-5.3-Flash/resolve/main/config.json)
++- [Z.ai Flash docs](https://docs.z.ai/guides/llm/glm-5.3-flash) · [Z.ai GLM-5.3 docs](https://docs.z.ai/guides/llm/glm-5.3)
++- [vLLM recipe](https://recipes.vllm.ai/zai-org/GLM-5.3-Flash) · [vLLM PR #53906](https://github.com/vllm-project/vllm/pull/53906)
++- [SGLang PR #36507](https://github.com/sgl-project/sglang/issues/36507) · [llama.cpp PR #27754](https://github.com/ggml-org/llama.cpp/pull/27754)
++- [LibertAI NVFP4 card](https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4) (+ [discussion](https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4/discussions/4))
++- [unsloth guide](https://unsloth.ai/docs/models/glm-5.3-flash) · [NVIDIA dgx-spark-playbooks](https://github.com/NVIDIA/dgx-spark-playbooks)
++- [kingjones30 2×Spark repo](https://github.com/kingjones30/GLM-5.3-Flash-2x-DGX-Spark) · [tonyd2wild 4×Spark repo](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark)
++- [NVIDIA forum: day-0 2×Spark](https://forums.developer.nvidia.com/t/glm-5-3-flash-running-on-2x-dgx-spark-sm-121-day-0-24-7-30-3-tok-s-with-mtp-5-two-silent-gb10-gotchas-worth-knowing/381433) · [43.4 t/s](https://forums.developer.nvidia.com/t/glm-5-3-flash-on-2x-nvidia-dgx-spark-43-4-tok-s-peak-checkpoint/381429) · [ox-alpha release](https://forums.developer.nvidia.com/t/glm-5-3-flash-weights-released-ox-alpha/381345)
++- [bird/GLM-spark (GLM-5.2)](https://github.com/bird/GLM-spark) · [glm5.app Spark analysis](https://glm5.app/blog/glm-5-3-flash-dgx-spark)
+diff --git a/docs/targets/qwen3.8-flash-next/README-upstream.md b/docs/targets/qwen3.8-flash-next/README-upstream.md
+new file mode 100644
+index 000000000..650bf1431
+--- /dev/null
++++ b/docs/targets/qwen3.8-flash-next/README-upstream.md
+@@ -0,0 +1,84 @@
++# Qwen3.8-Flash-Next on NVIDIA DGX Spark
++
++Serving **Qwen3.8-Flash-Next** (`qwen4_exp` architecture, ~180B-param multimodal MoE, 6B active/token) on **2× NVIDIA DGX Spark** (GB10, sm_121, 128 GB unified each) with three working stacks:
++
++1. **SGLang NVFP4, TP2, 1M context** (flagship — full quality, Docker-contained)
++2. **vLLM TP2, 512K context** (blazux image + Ray, PLE from NVMe, MTP 3 — live)
++3. **llama.cpp + 4-bit GGUF** (single-Spark fallback — PLE n-grams streamed from disk, MTP spec decode)
++
++## Highlights
++
++- **SGLang NVFP4 TP2 @ 1M ctx is proven** on 2× Spark over a direct CX7 RoCE rail: `RadixArk/Qwen3.8-Flash-Next-NVFP4` (135 GB, experts-only quant, in-band with BF16), NEXTN 3/1/4 spec decode, PLE table host-offloaded. **~40–44 t/s single-stream, ~148–155 tok/s aggregate** at 24 concurrent, KV pool 1.25–2.06M tokens (>1M guaranteed). Fully Docker-contained (`qwen38flashnext-dspark:local`). Currently **stopped** (the two Sparks are running vLLM TP2).
++- **Single-Spark SGLang with the PLE n-gram table streamed from NVMe** (open PR [sglang#36567](https://github.com/sgl-project/sglang/pull/36567), applied): full NVFP4 quality on ONE Spark — the 47.7 GiB PLE table stays on the SSD (~78 GiB resident), **1M ctx (YaRN) + NVFP4 KV with a 1,900,672-token pool (~2M), 4 concurrent clients, ~31 t/s single-stream / 43–51 tok/s aggregate**.
++- **The SM121 story**: stock/nightly SGLang still can't run this model on GB10 (TRT-LLM sparse decode silently corrupts long context; the fallback doesn't compile). The patched derivative image is the only working path today — see `docs/sglang-deployment.md`.
++- **vLLM TP2 @ 512K ctx is live** on the same CX7 RoCE rail (`scripts/vllm_tp2.sh`): blazux `qwen38-flash-dgx` + Ray 2.58, PLE mmap from NVMe, MTP 3, bf16 KV (QSA refuses fp8). **31.1 t/s single-stream, 74 tok/s aggregate at 8 concurrent**, KV pool 3.98M tokens (7.77× @ 512K). See `docs/vllm-perf.md`.
++- **llama.cpp GGUF fallback** (1× Spark): `-ngl 999 -ot "per_layer_token_embd.weight=CPU"` streams the 51B-param PLE table from the NVMe; **MTP spec decode works** (PR #27836 + grafted head): code 27.4 → 32.1 t/s (+17%). First published DGX Spark + llama.cpp + MTP run.
++- **Context ladder (llama.cpp)**: 512K with FP8 KV, 700K–1M with 4-bit KV — KV is cheap in this architecture (~24 KiB/token f16 across the 12 QSA layers).
++
++**Currently serving:** vLLM TP2 on both Sparks — `http://192.168.0.211:8000/v1`, model `qwen3.8-flash-next`, 512K ctx. SGLang TP2 / TP1 / llama.cpp are stopped.
++
++## Quick start
++
++- **SGLang NVFP4 TP2** (the full-quality path): follow [`docs/sglang-deployment.md`](docs/sglang-deployment.md) — clone the MiaAI recipe, set `.env` (template in `scripts/sglang/.env.example`), `./start.sh serve`.
++- **vLLM TP2** (512K, PLE from NVMe): `scripts/vllm_tp2.sh` on both Sparks (`RANK=0` / `RANK=1`). API `http://spark1:8000/v1`, model `qwen3.8-flash-next`. Details: [`docs/vllm-perf.md`](docs/vllm-perf.md).
++- **llama.cpp GGUF** (single Spark): scripts in [`scripts/`](scripts/README.md) (`spark_download.sh`, `spark_build.sh`, `spark_serve*.sh`).
++
++## Measured results
++
++**SGLang NVFP4 TP2** (2026-08-30, `bench_serving` + timed runs):
++
++| Config | Single-stream | Aggregate (24 conc) | E2E |
++|---|---|---|---|
++| NVFP4 KV | ~36 t/s | — | — |
++| fp8_e4m3 KV | ~38–42 t/s | 138.6 tok/s | 15.8 s |
++| **+ replayssm-spec (final)** | **~81–103 t/s** | **183–234 tok/s** | 9.4–11.9 s |
++
++**SGLang TP1 single-Spark, PLE from NVMe** (final: 1M ctx YaRN, NVFP4 KV, mem 0.88, NEXTN):
++
++| max_running_requests | Aggregate | Single-stream |
++|---|---|---|
++| 1 | 18.9 tok/s | ~21 t/s |
++| 4 | 43.0 tok/s | ~31 t/s |
++| 8 | 50.7 tok/s | — |
++
++KV pool at 1M ctx: bf16 454K · fp8 900K · **nvfp4 1.9M** (mem 0.88). Concurrency auto-clamps to 4 at 1M ctx (GDN/mamba state pool is the limit, not KV).
++
++**vLLM TP2** (2026-08-30, 512K YaRN, MTP 3, PLE mmap, bf16 KV, CX7 IB):
++
++| Config | Single-stream | Aggregate (8 conc) | KV pool |
++|---|---|---|---|
++| PIECEWISE + splitting_ops | **31.1 t/s** | **74.3 tok/s** | 3.98M tokens (7.77× @ 512K) |
++
++API: `http://192.168.0.211:8000/v1` · model `qwen3.8-flash-next`. Full gauntlet: [`docs/vllm-perf.md`](docs/vllm-perf.md).
++
++**llama.cpp GGUF** (1× Spark, 2026-08-29):
++
++| Config | Code | Prose |
++|---|---|---|
++| plain | 27.4 t/s | 27.3 t/s |
++| + MTP | 32.1 t/s (+17%) | 27.1 t/s |
++
++## Repo structure
++
++| Path | Contents |
++|---|---|
++| `docs/sglang-deployment.md` | SGLang NVFP4 TP2: full deployment runbook, .env, fixes, validation, gotchas |
++| `docs/sglang-perf.md` | Performance tuning: A/B matrix, measured numbers, ceilings |
++| `docs/research.md` | Model/hardware facts, runtime verdicts, memory math, sources |
++| `docs/plan.md` | Plans A/B/C, serving modes, KV/quant measurements, MTP status |
++| `docs/session-log.md` | Chronological build log: what was tried, measured, and learned |
++| `scripts/` | llama.cpp setup/serve scripts + SGLang `.env` template (see `scripts/README.md`) |
++| `assets/` | README charts (regenerate: `python scripts/gen_charts.py`) |
++
++GLM-5.3-Flash feasibility is a separate project.
++
++## Notes & caveats
++
++- **Software maturity**: SGLang qwen4_exp merged Aug 26 (PR #36497) but unreleased; SM121 needs the patched image (PR #36845 still open). llama.cpp `qwen4_exp` base is merged; MTP is PR #27836. GB10 runs are community-verified, not upstream-validated.
++- **UMA memory**: keep ≥8 GB headroom; booting under a full page cache can softlock the box (drop caches first — no sudo needed via the privileged-Docker one-liner in the deployment doc). mem-fraction 0.85+ risks the earlyoom SIGTERM.
++- **lmcache**: evaluated and deferred — hybrid-layout bugs open for qwen4_exp, and 1M fits without KV offload.
++- `--enable-torch-compile` breaks SM121 CUDA-graph capture (keep off); NEXTN steps 4 is impossible.
++
++## License
++
++Repo: MIT. Model weights: Qwen Community License 1.0 (see [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)).
+diff --git a/docs/targets/qwen3.8-flash-next/plan.md b/docs/targets/qwen3.8-flash-next/plan.md
+new file mode 100644
+index 000000000..6384c9673
+--- /dev/null
++++ b/docs/targets/qwen3.8-flash-next/plan.md
+@@ -0,0 +1,115 @@
++# Deployment Plan — Qwen3.8-Flash-Next on DGX Spark
++
++Decision tree that came out of the research (`docs/research.md`):
++
++```
++One Spark + NVFP4 135GB  → impossible (OOM at any ctx)
++Two Sparks + SGLang TP2  → full quality, 47–70 tok/s  ← endgame (Plan A)
++One Spark + GGUF 4-bit   → works, mmap + PLE on SSD    ← current attempt (Plan B)
++One Spark + smaller model→ Qwen3.8-27B-class NVFP4     ← fallback (Plan C)
++```
++
++## Plan A — SGLang, 2× Spark TP2, NVFP4 (full quality) — ✅ DONE 2026-08-30
++
++Proven by two independent community runs of this exact checkpoint, then deployed here. See **[`docs/sglang-deployment.md`](sglang-deployment.md)** (runbook) + **[`docs/sglang-perf.md`](sglang-perf.md)** (tuning). Measured at `spark1:8888`: **1M ctx, ~40–44 t/s single-stream, ~148–155 tok/s aggregate, NVFP4/fp8 KV, PLE offload, Docker-contained**. Currently **stopped** — the live stack is vLLM TP2 (`spark1:8000`, 512K, see [`docs/vllm-perf.md`](vllm-perf.md)).
++
++1. **Build SGLang with qwen4_exp support** (both units): PR [sgl-project/sglang#36497](https://github.com/sgl-project/sglang/pull/36497) (branch `qwen4-main-squashed@73a2552`) — not in any release — plus:
++   - one-line sm_121 QSA gate patch ([#36531](https://github.com/sgl-project/sglang/issues/36531));
++   - flash-attn ABI stub;
++   - JIT single-job: `MAX_JOBS=1 TORCHINDUCTOR_COMPILE_THREADS=4`.
++   Or use the community prebuilt `radixark/sglang-qwen38flashnext:sm121-qsa*` image.
++2. **Download** `RadixArk/Qwen3.8-Flash-Next-NVFP4` (135 GB) on both units. Repo is a private candidate release — needs HF token if gated.
++3. **Serve** (GB10-adapted from the card):
++   ```bash
++   python -m sglang.launch_server --model-path <path> --tp 2 \
++     --quantization modelopt_fp4 --fp4-gemm-backend flashinfer_cutlass \
++     --page-size 64 --mamba-scheduler-strategy extra_buffer --mamba-track-interval 64 \
++     --chunked-prefill-size 4096 --max-running-requests 8 --context-length 262144 \
++     --mem-fraction-static 0.80 --allow-auto-truncate --ple-offload-embedding \
++     --disable-radix-cache --max-mamba-cache-size 97 --max-total-tokens 600000 \
++     --enable-torch-compile
++   ```
++   plus MTP spec-decode flags (`steps=3`, `draft=4`) per the community recipes. `drop_caches` before launch. Expect 41–70 tok/s, ≤8 concurrent, 83–85 °C.
++4. **Verify**: OpenAI-compatible smoke test, GSM8K/AIME spot checks, throughput + memory/thermal monitoring.
++
++Notes: 2×Spark networking over ConnectX (200G) or 10GbE; `--tp 2` requires both units reachable from each other.
++
++## Plan B — GGUF 4-bit, llama.cpp, single Spark (DONE — serving on spark1)
++
++Chosen because: single-Spark viable, real n-gram disk streaming via mmap, quick validation of the model on real hardware.
++
++1. **Download** `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q4_K_XL` (111.3 GB, 4 shards) on `spark1` → `~/qwen3.8-flash-next/models/unsloth/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/` — script `scripts/spark_download.sh`, log `download.log`.
++2. **Build llama.cpp** with PR [#27742](https://github.com/ggml-org/llama.cpp/pull/27742), CUDA sm_121 — script `scripts/spark_build.sh`, log `build.log`. Targets: `llama-cli llama-mtmd-cli llama-server llama-gguf-split`.
++3. **Run smoke test** (mmap default; PLE pages stay on disk under memory pressure):
++   ```bash
++   ~/qwen3.8-flash-next/llama.cpp/build/bin/llama-cli \
++     -m ~/qwen3.8-flash-next/models/unsloth/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
++     -ngl 999 --ctx-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 \
++     -p "<your prompt>" -n 128
++   ```
++   (verify flags from `llama-cli --help` post-build: `-ngl`, mmap, `--spec-type draft-mtp` for the MTP draft, `--chat-template-kwargs '{"reasoning_effort":"medium"}'`.)
++4. **If OK**: optionally serve via `llama-server` (OpenAI-compatible) and/or repeat on `spark2`. Then decide: keep GGUF for quick single-Spark use, or proceed to Plan A for full quality.
++5. **If OOM**: drop to `UD-IQ4_XS` (93.7 GB) or a lower quant; or trim `--ctx-size`.
++
++## Plan C — smaller model on one Spark
++
++Qwen3.8-27B-class NVFP4 (fits one Spark; ~38 tok/s with DFlash2/DSpark draft). Only if a single Spark is a hard constraint and GGUF quality is insufficient.
++
++### MTP (multi-token prediction) — status 2026-08-29 (CORRECTED)
++
++**MTP IS possible on the llama.cpp/GGUF stack** — my 08-27 conclusion ("not possible, only via SGLang") was outdated within ~48h. Corrected state:
++
++- The Unsloth GGUF still ships **without** the MTP head (converter `no_mtp = True`; verified) — that part stands.
++- **llama.cpp PR #27742 (qwen4exp base) merged into master** (between 08-26 and 08-28). Master still has `supports_mtp_export = False` for qwen4exp — no MTP on stock master yet.
++- **llama.cpp PR [#27836](https://github.com/ggml-org/llama.cpp/pull/27836)** ("qwen4exp: add NextN/MTP draft head `--spec-type draft-mtp`") — open, working, community-used. It loads the 1-layer 4B MTP block (31 `mtp.*` tensors, exists in the BF16 source — **not** only in NVFP4 as I wrongly claimed) and routes MTP contexts to a plain KV cache.
++- **MTP-head GGUFs published** (2026-08-27/28): [jlkivey (PR#27836 graft route)](https://huggingface.co/jlkivey/Qwen3.8-Flash-Next-MTP-PR27836-GGUF), [dzannotti (`-md` sidecar)](https://huggingface.co/dzannotti/Qwen3.8-Flash-Next-MTP-GGUF), [quimmedes (`-md`)](https://huggingface.co/quimmedes/Qwen3.8-Flash-Next-MTP-GGUF), [ashbash (MLX only)](https://huggingface.co/ashbash/Qwen3.8-Flash-Next-MTP-Drafter-GGUF). **Patch and head must be paired** — the routes use incompatible tensor layouts.
++- **Community-verified speedups** (llama.cpp + qwen4exp + draft-mtp, n-max 2–3): +30–90% on code/structured, ~neutral on prose. E.g. Strix Halo UD-Q4_K_XL: 20.3 → 35.8 t/s code; M5 Max UD-IQ4_XS: 38.5 → 50.4 t/s code (acceptance 0.57–0.90). Tuning: `--spec-draft-n-max 3 --spec-draft-p-min 0.75` ("stop drafting when the head is unsure").
++- **Recipe sketch** (dzannotti sidecar route):
++  ```bash
++  LLAMA_ATTN_ROT_DISABLE=1 llama-server \
++    -m <main UD-Q4_K_XL shard1> -md <MTP-Q4_K_M.gguf> -ngld 999 \
++    --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 \
++    -ngl 999 -fa on -ctk q8_0 -ctv q8_0
++  ```
++  Memory: head adds ~2.5 GB (Q4_K_M) → fits the 16K config (~113 G/121 G); too tight for 700K+ ctx configs.
++- **No published DGX Spark + llama.cpp + MTP run yet** (as of 08-29) — we'd be first.
++- **Our DGX Spark measurement (2026-08-29, UD-Q4_K_XL + jlkivey graft, PR #27836 build `1d8de7c1b`, parallel 1, f16 KV, `-fa on`)**: code 27.4 → **32.1 t/s (+17%)**; prose 27.3 → 27.1 t/s (neutral). **First published DGX Spark + llama.cpp + MTP run.** Community (Metal/ROCm) saw larger code gains (+30–90%) with q8_0 KV / mlock / their tuning. Graft verify passed (1256 tensors, 5 shards).
++- **Tuning sweep (2026-08-29, same box)**: q8_0 KV + n-max 3 → code ~29.3 t/s (consistently slightly *worse* than f16's 32.1), prose ~31.3; n-max 2 ≈ n-max 3. Single-run variance ±10%. **Verdict: f16 KV + n-max 3 remains the best config** on this box.
++- SGLang NVFP4 on 2×Spark TP2 remains the higher-throughput path (47–70 t/s with MTP4).
++
++## Live runbook — Plan B attempt
++
++| Step | Machine | Status |
++|---|---|---|
++| SSH access (key-based, aliases `spark1`/`spark2`) | — | ✅ |
++| venv + `hf` CLI | spark1 | ✅ |
++| GGUF download (111.3 GB, UD-Q4_K_XL × 4 shards) | spark1 | ✅ (xet stalled → `HF_HUB_DISABLE_XET=1` plain-HTTP resume) |
++| llama.cpp build (PR 27742, sm_121 CUDA) | spark1 | ✅ llama.cpp 0.3.0-dev (commit `6c5afc86a`) |
++| Smoke test (`scripts/spark_smoke.sh`) | spark1 | ✅ PASSED — thinking trace + `4`, 7.9 t/s (CPU/mmap) |
++| **Serve: GPU experts + PLE on disk** (`spark_serve.sh`) | spark1 | ✅ **live at `spark1:8080`** — ~25 t/s, ~110 G/10 G |
++| 1M ctx (iq4_nl KV) / 512K (q8_0 KV) | spark1 | ✅ tested / script ready |
++| MTP (spec decode) | spark1 | ✅ **done 2026-08-29** — PR #27836 build + grafted MTP head; code 27.4 → 32.1 t/s (+17%), prose neutral |
++| Plan A: SGLang NVFP4 2×Spark TP2 | spark2+both | ⏳ decision point |
++
++Full chronological record: [`docs/session-log.md`](session-log.md). Script inventory: [`scripts/README.md`](../scripts/README.md).
++
++### Serving modes tested (2026-08-27, spark1)
++
++| Mode | Command essence | Result |
++|---|---|---|
++| Full GPU offload | `-ngl 1024` | ❌ softlocked the box (OOM livelock → auto-reboot): full 111 GB GPU copy on the 121 GiB pool |
++| CPU + mmap | `-ngl 0` | ✅ works, 7.9 t/s; ~110 GB file-backed RSS, fully reclaimable |
++| **GPU + PLE on disk** | `-ngl 999 -ot "per_layer_token_embd.weight=CPU"` | ✅ **~24.7 t/s**, load in ~1.5 min, ~110 G used / 10 G avail (PLE table mmap'd from NVMe, 16 rows/token) |
++| **+ MTP spec decode** (current 08-29) | `spark_serve_mtp.sh`: PR #27836 build + grafted MTP head, `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 -fa on`, 16K×1, f16 KV | ✅ **code 32.1 vs 27.4 t/s (+17%), prose neutral**; 113/121 G used, 8 G avail; first DGX Spark llama.cpp MTP run |
++
++- Cold load takes ~13 min single-threaded (~295K tensors; PR #27742 loader). `--no-warmup` used.
++- PLE tensor name in the GGUF: `per_layer_token_embd.weight` (dims 160×320,001,536; 51.2 G elements). Experts: `blk.N.ffn_{gate,up,down}_exps.weight`.
++- **KV cache**: 4 slots × 16,384 ctx (`n_slots=4, n_ctx_slot=16384, kv_unified=true`) = 65,536 tokens capacity. **KV is ~24 KiB/token f16** — 12 QSA layers × (2 KV heads × 256 dims × 2) — NOT 2 KiB/token (that was per-layer). So: 16K×4 slots ≈ 1.6 GB; 1M ctx ≈ 23.9 GB (f16) / 12.7 GB (q8_0) / 6.4 GB (iq4_nl). The 36 GDN layers use fixed recurrent state, not KV. **Measured ctx×KV fits (single slot)**: 512K `q8_0` ✅ ~7 G headroom; **700K `q8_0` ❌ swap-thrash (121/121 + growing swap)**; **700K `iq4_nl` ✅ ~4–5 G headroom (verified serving, the most comfortable big-ctx config)**; **800K `q8_0` ❌ swap-thrash**; **800K `iq4_nl` ✅ ~1 G headroom (verified)**; 1M `iq4_nl` ✅ ~1 G headroom. FP8 ceiling is ~512–640K. The ~3 KiB/token QSA indexer cache stays f16 in this build (not quantized).
++- **1M ctx config** (`spark_serve_1m.sh`): `--ctx-size 1000000 --parallel 1 --cache-type-k/v iq4_nl --rope-scaling yarn --rope-scale 4.0 --yarn-orig-ctx 262144 --override-kv qwen4exp.context_length=int:1000000`. At q8_0 KV the box ran 120/121 G used + 9 G swap (too tight); iq4_nl KV → 120/121 G used, **0 swap**, serving (verified completion). 1M leaves only ~1 G headroom — knife-edge. **512K with q8_0** (`spark_serve_512k.sh`) → ~7 G headroom (recommended for daily use). YaRN factor 4 = Qwen's static recipe for 1M; note their warning that static YaRN slightly affects short-context quality. KV types available in this build: f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1 ("turboquant" is not a llama.cpp type; q8_0 ≈ FP8).
++- **Quant mix (UD-Q4_K_XL, 104.9 GB)**: Q4_K 41.8 GB (experts) + IQ4_NL 27.1 GB (PLE n-gram table) + Q5_1 24.9 GB (some experts) + Q8_0 9.6 GB (attention/small) + ~1.5 GB misc. Measured prompt eval 76.7 t/s, generation 25.7 t/s.
++
++## Blockers / notes
++
++- Download + build run detached on `spark1` (`~/qwen3.8-flash-next/`, logs `download.log` / `build.log`). They survive SSH disconnects (`setsid nohup`).
++- If `-DCMAKE_CUDA_ARCHITECTURES=121` misbehaves, fall back to `120` (GB10 JITs PTX from sm_120). Configure step already passed with 121.
++- Do not run model workloads on the desktop (x86_64, no GPU) — Sparks only.
+diff --git a/docs/targets/qwen3.8-flash-next/research.md b/docs/targets/qwen3.8-flash-next/research.md
+new file mode 100644
+index 000000000..3e472e4d7
+--- /dev/null
++++ b/docs/targets/qwen3.8-flash-next/research.md
+@@ -0,0 +1,123 @@
++# Research — Qwen3.8-Flash-Next on DGX Spark
++
++Research date: 2026-08-27. Cross-verified from Hugging Face model cards/configs, SGLang/vLLM/llama.cpp docs, NVIDIA playbooks, and two independent community deployments of this exact model on DGX Spark systems (tonyd2wild, pocharlies — both dated 2026-08-26/27).
++
++## 1. Goal & constraints
++
++- Serve **RadixArk/Qwen3.8-Flash-Next-NVFP4** on the DGX Spark(s).
++- Preference: **PLE n-gram tables streamed from disk** (memory pressure: 128 GB unified, ~121 GiB usable).
++- Question asked: **llama.cpp or vLLM?**
++
++## 2. The model
++
++RadixArk NVFP4 = NVFP4 (W4A4) quantization of **Qwen/Qwen3.8-Flash-Next** ([card](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)), the open-weight **experimental preview of the Qwen4 architecture** (`model_type: qwen4_exp`).
++
++| Property | Value |
++|---|---|
++| Total params | ~180B = 125B main + 51B PLE n-gram + 4B MTP |
++| Active params | **6B/token** (512 routed experts, top-10 + 1 shared, per layer) |
++| Layers | 48 = 12 × (3 × (Gated DeltaNet → MoE) → 1 × (QSA → MoE)) |
++| Attention | GDN (linear) + **QSA** (Qwen Sparse Attention, micro-block, only 12/48 layers hold growing KV) |
++| Gated residual | 4 branches, bottleneck rank 320 |
++| PLE n-gram | 20M-entry base vocab; 8 bigram + 8 trigram hash heads; layer 2; 51.2B params |
++| MTP | 1-layer (4B) multi-step predictor — the **built-in spec-decode draft** (no separate draft model exists) |
++| Multimodal | text / image / video; ctx 262,144 native (extensible to 1M) |
++| Source size | 360 GB BF16 |
++| NVFP4 checkpoint | **135 GB** (~2.7× smaller); only routed experts quantized (294,912 tensors); attention/QSA/GDN/mHC/shared experts/routers/embeddings/LM head/vision/MTP stay BF16; PLE tables FP8 |
++
++References: [Qwen model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [LMSYS/SGLang day-0 blog](https://www.lmsys.org/blog/2026-08-26-qwen-flash-next), [Qwen GitHub README](https://github.com/QwenLM/Qwen3.8-Flash-Next/).
++
++## 3. PLE n-gram tables (the "ngrams")
++
++- Config: `ngram_size: 3`, `ngram_vocab_size_base: 20000000`, `split_ngram_parts: 128`, `heads_per_ngram: 8`, `ple_embed_dim: 2560`, `ple_layer_ids: [2]`.
++- 51.2B params = 16 heads × 20M rows × 160 values. Stored as **128 shard tensors**.
++- On disk: **51.2 GB FP8** (F8_E4M3 + per-table scalar, from the `-FP8` revision) ≈ 47.7 GiB.
++- In RAM if dequantized to BF16: **102.4 GB** ≈ 95.4 GiB.
++- Access pattern: sparse lookup — each token reads exactly **16 rows** (2.5K values). It is a random-access store, not a GEMM weight; keeping it off-GPU costs almost nothing per step.
++
++## 4. Memory math (single Spark: ~121 GiB usable)
++
++| Config | Resident | Fits? |
++|---|---|---|
++| Full load NVFP4 (experts packed, PLE→BF16, rest BF16) | ~174 GiB | ❌ |
++| NVFP4 + PLE streamed from disk | ~78 GiB + KV (4–17 GiB) | ✅ ~82–95 GiB |
++| NVFP4, PLE kept FP8 (no dequant) | ~126 GiB | ❌ (over 121, and no serving path does this) |
++
++**2× Spark TP2** (demonstrated config): ~74 GiB/rank (PLE split vocabulary-parallel) + KV → fits with 23–35 GiB headroom. This is why the model card's command (`--tp 2`, GB300/B300-validated) cannot work on a single GB10 — `--tp 1` OOMs at any context length; `--max-running-requests 36` is unrealistic (community caps at ~8, bounded by the GDN state pool).
++
++## 5. Runtime verdicts
++
++| Runtime | Serves `qwen4_exp`? | NVFP4 on GB10 (sm_121)? | Verdict for this model |
++|---|---|---|---|
++| **SGLang** | ✅ day-0 ([blog](https://www.lmsys.org/blog/2026-08-26-qwen-flash-next)); support is **PR [#36497](https://github.com/sgl-project/sglang/pull/36497)**, not a release; needs one-line sm_121 QSA gate patch ([#36531](https://github.com/sgl-project/sglang/issues/36531)) + flash-attn ABI stub | ✅ community-verified (2×Spark: [tonyd2wild](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark), [pocharlies](https://github.com/pocharlies/qwen38-flash-next-dgx-spark-sglang)); 47–70 tok/s with MTP4 | **The only full-quality path.** Requires 2× Spark TP2 |
++| **vLLM** | Partial: FP8/BF16 recipe + image exist ([recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next)), validated GB300/H200/MI355X, **no GB10**; **cannot load RadixArk's FP8-PLE tensors** | NVFP4+qwen4_exp on GB10: no evidence | ✗ for the RadixArk checkpoint |
++| **llama.cpp** | Via unmerged **PR [#27742](https://github.com/ggml-org/llama.cpp/pull/27742)** (+ [Unsloth guide](https://unsloth.ai/docs/models/qwen3.8-next)); GGUF quants only (cannot load NVFP4 safetensors) | Native sm_121 CUDA builds exist | ✅ single-Spark route: **GGUF + mmap + PLE on SSD** — the only real "ngrams streamed from disk" |
++
++### "N-grams streamed from disk" — what it really means
++
++- **SGLang** offloads the PLE table to *pinned host RAM* (`--ple-offload-embedding`). On a discrete-GPU box that saves VRAM; on the Spark's unified memory it is the **same 128 GB pool — no savings** → still OOM on one Spark. No disk-resident PLE option ([open request #36514](https://github.com/sgl-project/sglang/issues/36514)).
++- **vLLM** `VLLM_PLE_CPU_OFFLOAD=1` uses pageable memory → OS can swap to SSD (measured ~30 tok/s on one Spark, but with a different community checkpoint, not RadixArk's).
++- **llama.cpp** mmaps the GGUF → weights page in from disk on demand. Unsloth explicitly recommends offloading the PLE/Ngram layer to SSD with mmap ([guide](https://unsloth.ai/docs/models/qwen3.8-next)). 4-bit quant tables also keep PLE cheap (PLE is only ever quantized to 4-bit min even in 1-bit quants).
++- llama.cpp's `--ngram` flags are context-statistics self-speculation, **unrelated** to the PLE tables.
++
++## 6. GGUF quants (Unsloth, `unsloth/Qwen3.8-Flash-Next-GGUF`)
++
++| Quant | Size | KLD |
++|---|---|---|
++| **UD-Q4_K_XL** (chosen) | **111.3 GB** | 0.0447 |
++| UD-IQ4_XS | 93.7 GB | 0.0791 |
++| UD-Q3_K_XL | 90.0 GB | 0.0997 |
++| UD-IQ3_XXS | 82.0 GB | 0.1565 |
++| UD-Q2_K_XL | 78.9 GB | 0.2133 |
++| UD-IQ1_M | 74.5 GB | 0.3022 |
++| UD-IQ1_S | 72.5 GB | 0.3751 |
++
++`UD-Q4_K_XL` shards (verified via HF API): `-00001-of-00004.gguf` (10.9 MB), `-00002` (49.86 GB), `-00003` (49.38 GB), `-00004` (12.09 GB).
++
++## 7. Hardware (DGX Spark — verified live)
++
++- GB10: Blackwell GPU sm_121 (compute 12.1a) + 20-core Arm CPU (10× Cortex-X925 + 10× A725), **128 GB LPDDR5x unified**, ~273 GB/s, 4 TB NVMe, 240 W. [NVIDIA page](https://www.nvidia.com/en-us/products/workstations/dgx-spark/), [hardware guide](https://docs.nvidia.com/dgx/dgx-spark/hardware.html).
++- DGX OS (Ubuntu 24.04 ARM), driver 580.173.02, CUDA 13.0 toolkit at `/usr/local/cuda`. [release notes](https://docs.nvidia.com/dgx/dgx-spark/release-notes.html)
++- Live check `spark1`/`spark2`: `aarch64`, 20 cores, 121 GiB usable, GB10, 2.4–2.5 TB free, docker 29.2.1, python 3.12, gcc 13.3.
++
++## 8. Precedents (community, this exact model, 2026-08-26/27)
++
++- **2× Spark TP2 SGLang NVFP4**: ~70 tok/s peak / ~47 typical (MTP4 + CUDA graphs); ~41–42 tok/s single-stream; up to ~153 tok/s @ 8 concurrent; KV pool up to 600K–1.05M tokens (~10–17 GB). [tonyd2wild](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark), [pocharlies](https://github.com/pocharlies/qwen38-flash-next-dgx-spark-sglang)
++- Known GB10 quirks: `--mem-fraction-static 0.85` OOMs during CUDA-graph capture (use 0.78–0.80); drop page cache (`sync; echo 3 > /proc/sys/vm/drop_caches`) before launch (UMA); JIT build must be single-job; sustained load runs 83–85 °C.
++- Similar-size single-Spark precedents: Nemotron-3-Super-120B-A12B-NVFP4 @ 22.7–23.7 tok/s on one Spark via vLLM ([blog](https://vllm.ai/blog/2026-06-01-vllm-dgx-spark)); gpt-oss-120b MXFP4 on Spark via SGLang.
++- The card's "118.4 GB unchanged BF16" figure **already includes the PLE tables** — do not add dequantized PLE on top of it (double-counts 102.4 GB).
++
++## 9. License
++
++Qwen Community License 1.0 ([LICENSE](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/raw/main/LICENSE)): display name if >100M MAU / >$20M monthly revenue; separate license required for Model-as-a-Service; internal use exempt.
++
++## 10. Sources- [RadixArk/Qwen3.8-Flash-Next-NVFP4 model card](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
++- [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) + [config.json](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/config.json)
++- [LMSYS/SGLang day-0 blog](https://www.lmsys.org/blog/2026-08-26-qwen-flash-next), [SGLang cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next), [sglang#36514](https://github.com/sgl-project/sglang/issues/36514), [sglang#36531](https://github.com/sgl-project/sglang/issues/36531)
++- [vLLM recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next), [vLLM DGX Spark blog](https://vllm.ai/blog/2026-06-01-vllm-dgx-spark)
++- [Unsloth guide](https://unsloth.ai/docs/models/qwen3.8-next), [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
++- [llama.cpp PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742), [llama.cpp speculative.md](https://raw.githubusercontent.com/ggml-org/llama.cpp/master/docs/speculative.md)
++- NVIDIA [DGX Spark page](https://www.nvidia.com/en-us/products/workstations/dgx-spark/), [playbooks](https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/sglang/README.md)
++- Community: [tonyd2wild](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark), [pocharlies](https://github.com/pocharlies/qwen38-flash-next-dgx-spark-sglang), [dolf3131](https://github.com/dolf3131/qwen3.8-flash-next-dgx-spark)
++
++
++---
++
++## 11. Model card re-check (addendum 2026-08-27)
++
++Re-verified against the [RadixArk NVFP4 card](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4), the [SGLang cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next), and the [Qwen source card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next):
++
++- **NVFP4 officially targets B200 / B300 / GB300 only** — the cookbook's "Where it runs" table lists exactly those for NVFP4; **GB10 (DGX Spark) is community-verified, not upstream-validated**.
++- **MTP is the designed spec-decode mechanism**: *"a multi-step-trained MTP module, whose own full-attention layers are QSA as well, which is what keeps speculative acceptance high in practice."* The NVFP4 checkpoint keeps **all 31 MTP tensors BF16**.
++- SGLang `qwen4_exp` support is **not in any tagged release** — build the model-support PR (sgl-project/sglang#36497).
++- **Thinking cannot be turned off** for this model; use `--reasoning-parser auto` in SGLang to split `reasoning_content`. SGLang applies the checkpoint's own `generation_config.json` — leave sampling unset.
++- Official 1M recipe (matches what was applied in llama.cpp): YaRN `rope_theta 10000000, factor 4.0, original_max_position_embeddings 262144`; SGLang form: `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 ... --json-model-override-args '{...}' --context-length 1000000`. Static YaRN slightly affects short-context quality (Qwen's own note).
++- Param-count note: Qwen card says 125B + 51B + 4B MTP ≈ 180B; the SGLang cookbook says 176B total. Difference is unaccounted MTP/main overlap — not material for serving.
++
++---
++
++## 12. GLM-5.3-Flash on 2× DGX Spark
++
++Tracked as a **separate project** (sibling directory `~/Desktop/glm-5.3-flash/`, its own git repo) — not part of this workspace.
++
++TL;DR of the feasibility check: **runs on 2× Spark TP2 with 4-bit-class weights** (NVFP4 ~97 GB/node or GGUF Q4_K_XL), proven day-0 at 24.7–30.3 t/s; FP8 needs 4× Spark; single Spark only fits lossy 1-bit. Conflicts with the Qwen Plan A (both need TP2 on both nodes).
+diff --git a/docs/targets/qwen3.8-flash-next/session-log.md b/docs/targets/qwen3.8-flash-next/session-log.md
+new file mode 100644
+index 000000000..b3eefedc1
+--- /dev/null
++++ b/docs/targets/qwen3.8-flash-next/session-log.md
+@@ -0,0 +1,362 @@
++# Session Log — Qwen3.8-Flash-Next on DGX Spark (2026-08-27)
++
++Chronological record of everything done, measured, and learned. Companion to `research.md` (facts) and `plan.md` (plans).
++
++## Goal & constraints
++
++Serve `RadixArk/Qwen3.8-Flash-Next-NVFP4` on the DGX Spark(s); user preference: **ngrams streamed from disk**; question: **llama.cpp or vLLM?** Then: "try a GGUF 4-bit"; then GPU experts + PLE-on-disk; then 1M ctx; then MTP.
++
++## Phase 1 — Research (start of session)
++
++- Fetched the RadixArk model card: NVFP4 W4A4 (experts only) of Qwen3.8-Flash-Next (`qwen4_exp`), ~180B = 125B main + 51B PLE + 4B MTP, 6B active/token, 48 layers (12× GDN×3 + QSA×1), 512 experts top-10, ctx 262K, checkpoint **135 GB** (from 360 GB BF16). Card's serve command is SGLang-only (`qwen4_exp` support required), validated on **GB300/B300** with `--tp 2`.
++- Two research agents produced cross-verified findings:
++  - PLE n-gram tables: 51.2B params, 128 shards, **51.2 GB FP8 on disk / 102.4 GB BF16 in RAM**; sparse lookup (16 rows/token).
++  - Single Spark (121 GiB usable) cannot host NVFP4 fully (~174 GiB) → **2×Spark TP2 required** for SGLang; community runs (tonyd2wild, pocharlies, 2026-08-26/27) measured **47–70 t/s with MTP4**.
++  - vLLM: recipe exists for FP8/BF16 (GB300/H200/MI355X) but **cannot load RadixArk's FP8-PLE tensors**; NVFP4+GB10 unvalidated.
++  - llama.cpp: `qwen4_exp` only via **unmerged PR #27742**; GGUF-only; mmap is the only true disk-streaming path.
++  - **No draft model exists** — the 1-layer 4B **MTP head is the built-in spec-decode draft**.
++- **Verdict**: llama.cpp or vLLM? → Neither for NVFP4. SGLang (2×Spark) is the full-quality path; GGUF+llama.cpp is the single-Spark path.
++
++## Phase 2 — Access & connectivity
++
++- The originally-given host address was unreachable (`No route to host`, ARP failed). User revealed the two Sparks (aliases `spark1`/`spark2`), reachable via the **NVIDIA Sync key**.
++- Verified both: GB10, sm_121 (compute 12.1), 20 cores aarch64, 121 GiB usable, driver 580.173.02, CUDA 13.0 toolkit, ~2.4 TB free, Docker 29.2.1.
++- User instruction: **do not use the desktop** (no GPU) — all model work on the Sparks.
++
++## Phase 3 — GGUF 4-bit attempt on spark1 (Plan B)
++
++### 3.1 Download (16:45–17:0x)
++
++- `hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*"` (111.3 GB, 4 shards) via venv (`~/.venv`).
++- **Stall**: xet transfer froze at 41,050,384,124 bytes (~10 min no progress). Killed; restarted with `HF_HUB_DISABLE_XET=1` → resumed over plain HTTP at ~100 MB/s, completed (`✓ Downloaded`). Cleaned 41 GB of stale `.incomplete` temp files.
++- Lesson: `pkill -f "hf download"` self-matches the SSH shell (the pattern is in its own cmdline) → kills the session. Use the `[h]` bracket trick.
++
++### 3.2 Build (16:45–17:0x)
++
++- `git clone llama.cpp && git fetch origin pull/27742/head:pr-27742 && checkout pr-27742`
++- `cmake -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121` — sm_121 accepted, build OK in ~10 min. Binaries: `llama-cli`, `llama-server`, `llama-mtmd-cli`, `llama-gguf-split`.
++- Lesson: backgrounding chains over SSH (`cmd & cmd2`) breaks cwd — use absolute paths or one chain per job (`setsid nohup` + absolute paths).
++
++### 3.3 Smoke test — three attempts
++
++| Attempt | Config | Result |
++|---|---|---|
++| 1 | `-ngl 1024` (full GPU offload) | ❌ **softlocked the box** (OOM livelock at 121/121 G → auto-reboot). Two instances were launched (watcher race), each copying 111 GB into the unified pool. |
++| 2 | `-ngl 0` (CPU + mmap) | ✅ **worked** — `What is 2+2?` → thinking trace + `4`, `Generation: 7.9 t/s`. Load took ~13 min (single-threaded over ~295K tensors); box stayed responsive (~110 GB file-backed RSS is reclaimable). |
++| 3 | `-ngl 999 -ot "per_layer_token_embd.weight=CPU"` | ✅ **~24.7 t/s, load ~1.5 min** — the winning config (see Phase 4). |
++
++- Misdiagnosis along the way: a 2.5 GB `smoke_raw.log` of `\n\r` junk looked like a hang; it was llama.cpp's REPL/spinner rendering while the loader ground through ~295K tensors. `syscw` counts (1.8B write syscalls) were the spinner on a pipe, not a bug. The loader is pathologically slow single-threaded but does finish.
++- `--no-warmup` used to skip the extra warmup run.
++
++## Phase 4 — GPU experts + PLE streamed from disk (the user's ask)
++
++- GGUF tensor analysis (manual GGUF header parser — the `gguf` PyPI reader returned 0 tensors because shard 1 is metadata-only with per-shard headers in shards 2–4):
++  - PLE n-gram table = **`per_layer_token_embd.weight`** (dims 160×320,001,536 = 51.2 G elements, type IQ4_NL).
++  - Experts = `blk.N.ffn_{gate,up,down}_exps.weight` (0.84 G elements each, 512 experts × 48 layers).
++- Final config (`scripts/spark_serve.sh`): `-ngl 999 -ot "per_layer_token_embd.weight=CPU" --ctx-size 16384 --parallel 4 --no-warmup`.
++- Results: **24.7 t/s** generation (measured 157 tok / 6.5 s; server logs: 25.0–25.7 t/s), prompt eval 76.7 t/s, load ~1.5 min, ~110 G used / 10 G available. Correct outputs incl. thinking traces.
++- Memory accounting: ~86 GB CUDA (unified) + ~30 GB process RSS; the ~25 GB PLE stays as mmap'd file pages on the NVMe (16 rows/token touched).
++
++## Phase 5 — KV cache & quantization answers
++
++- **KV = ~24 KiB/token at f16** (12 QSA layers × 2 KV heads × 256 dims × 2). My first answer (2 KiB/token) was wrong — that's per-layer; corrected in `plan.md`.
++- 16K×4 slots ≈ 1.6 GB KV; 1M ctx ≈ 23.9 GB (f16) / 12.7 GB (q8_0) / 6.4 GB (iq4_nl) + indexer cache (~3 GB f16 at 1M, not quantizable in this build).
++- **Quant mix of UD-Q4_K_XL** (from GGUF header): Q4_K 41.8 GB (experts) + IQ4_NL 27.1 GB (PLE) + Q5_1 24.9 GB (some experts) + Q8_0 9.6 GB (attention/small) + ~1.5 GB misc = 104.9 GB.
++
++## Phase 6 — 1M context (YaRN + quantized KV)
++
++- GGUF declares `qwen4exp.context_length = 262144`, `rope.freq_base = 1e7`.
++- Tried `--ctx-size 1000000 --parallel 1 --rope-scaling yarn --rope-scale 4.0 --yarn-orig-ctx 262144 --override-kv qwen4exp.context_length=int:1000000`:
++  - With `--cache-type-k/v q8_0`: loaded+served but 120/121 G used + **9 G swap** — too tight.
++  - With `--cache-type-k/v iq4_nl`: **120/121 G used, 0 swap, serving** (verified completion `1M context works`) — ~1 G headroom = knife-edge.
++- Created `spark_serve_512k.sh` (512K ctx, q8_0 KV → ~7 G headroom) as the recommended daily long-context config.
++- YaRN factor 4 = Qwen's static 1M recipe; their warning: static YaRN slightly degrades short-context quality.
++
++## Phase 7 — MTP investigation
++
++- `--spec-type draft-mtp` exists in the build (docs: "Use MTP heads from the main model"), but:
++  - The GGUF has **no MTP head**: tensor blocks only span `blk.0–47`; no `mtp`/`nextn` metadata; `n_layer_nextn` absent.
++  - The converter **deliberately drops it**: `conversion/qwen4exp.py` — "the MTP block is a separate draft head; vLLM drops it too; `supports_mtp_export = False`". So **no GGUF for this model can carry MTP today**.
++  - Tried `--spec-type ngram-mod` as a stopgap: **not engaged** (0 spec lines in log), no speedup (24.4 vs 25.7 t/s).
++- **MTP exists only in the NVFP4 checkpoint** (31 BF16 MTP tensors) → the only real MTP path is **SGLang `qwen4_exp` on 2×Spark TP2** (Plan A): proven 47–70 t/s with MTP4.
++
++## Phase 8 — Model card re-check
++
++- RadixArk card: unchanged; confirms 31 MTP tensors kept BF16 in NVFP4; SGLang-only; card's command has no MTP flags (community recipes add `steps=3, draft=4`).
++- SGLang cookbook: support not in any release (build PR); **NVFP4 officially targets B200/B300/GB300 only** (GB10 = community-verified); MTP "keeps speculative acceptance high"; **thinking cannot be turned off** (`--reasoning-parser auto`); leave sampling unset (SGLang applies `generation_config.json`).
++- Qwen card: official 1M YaRN recipe = `rope_theta 1e7, factor 4.0, original_max 262144` — matches what we applied in llama.cpp.
++
++## Measured numbers (spark1)
++
++| Metric | Value |
++|---|---|
++| Load time (cold, `-ngl 0`) | ~13 min |
++| Load time (`-ngl 999` + PLE on disk) | ~1.5 min |
++| Generation | 7.9 t/s (CPU) → **24.7–25.7 t/s** (GPU + PLE on disk) |
++| Prompt eval | 76.7 t/s |
++| Memory (16K×4 config) | ~110–111 G used / ~10 G available, 0 swap |
++| Memory (1M×1, iq4_nl KV) | ~120 G used / ~1 G available, 0 swap |
++| KV per token (f16) | ~24 KiB (12 QSA layers) |
++| GGUF on disk | 104 GB (4 shards) |
++
++## Lessons learned
++
++1. **Unified-memory OOM is a softlock**: a full-model GPU copy (111 GB) on the 121 GiB pool livelocks the allocator → auto-reboot. File-backed (mmap) memory is reclaimable and safe; anonymous CUDA copies are not. Keep ≥5–10 GB headroom.
++2. **`-ot "<tensor>=CPU"` is the lever** for per-tensor placement in llama.cpp — that's how you stream specific weights from disk.
++3. **GGUF multi-file headers**: shard 1 can be metadata-only; per-shard headers carry the tensor lists. The `gguf` PyPI reader misreports 0 tensors in that layout — parse manually.
++4. **`pkill -f` self-match** kills your own SSH session; use `[x]` bracket patterns.
++5. **Spinner floods**: llama.cpp's loader spinner writes unbounded output when stdout is a pipe/file — don't mistake it for a hang; check `/proc/<pid>/io` (syscw) and CPU for real progress.
++6. **KV is tiny in QSA architectures** — long context is memory-cheap here; the binding constraint is total weights + headroom.
++7. **MTP for this model only exists in SGLang+NVFP4** — the GGUF toolchain deliberately drops the head.
++
++## Open items / next steps
++
++1. **Decision point**: SGLang Plan A (2×Spark NVFP4, 47–70 t/s, MTP) vs keep the GGUF server (~25 t/s).
++2. Plan A first steps: clone sglang PR #36497 on both Sparks + sm_121 QSA gate patch (#36531) + flash-attn ABI stub; `MAX_JOBS=1`; download 135 GB NVFP4 ×2 (HF token if gated); serve TP2 (`drop_caches` before launch; mem-fraction 0.78–0.80; ≤8 concurrent).
++3. Sync `spark_serve_512k.sh` to the Spark if 512K becomes the daily config.
++
++
++## Phase 9 — 800K context test (FP8 vs iq4_nl KV)
++
++- **800K + q8_0 (FP8) KV: does NOT fit.** Measured 121/121 G used, 0 available, **swap climbing to 5 G** — same softlock-adjacent pattern as 1M/FP8. The QSA KV alone at FP8 is ~12.75 KiB/token × 800K ≈ 10.4 GB, plus the always-f16 indexer cache (~3 KiB/token ≈ 2.4 GB) and cell metadata.
++- **800K + iq4_nl KV: fits.** 120/121 G used, **0 swap**, verified serving (`800k works`). ~1 G headroom — knife-edge like 1M, but functional.
++- Conclusion: 800K is reachable only with 4-bit KV on this box; FP8 tops out around 512–640K. Configs: `scripts/spark_serve_800k.sh` (q8_0) and the `_iq4nl` variant.
++
++
++## Phase 10 — 700K context test
++
++- **700K + q8_0 (FP8) KV: does NOT fit** — 121/121 used, 0 available, swap climbing (2 GB). FP8 ceiling on this box is ~512–640K.
++- **700K + iq4_nl KV: fits comfortably** — 116/121 used, ~4–5 G headroom, 0 swap, verified serving (`700k works`). The best big-context config (more headroom than 800K/1M).
++- Configs: `scripts/spark_serve_700k.sh` (q8_0, reference) + `_iq4nl` variant (recommended).
++
++
++## Phase 11 — MTP correction (2026-08-29)
++
++My 08-27 conclusion ("MTP impossible on the GGUF stack; head exists only in NVFP4") was **wrong / outdated within 48h**, corrected via online research:
++
++- llama.cpp PR **#27742 (qwen4exp base) merged into master** (08-26/28). Master still has no qwen4exp MTP.
++- llama.cpp PR **#27836** (open) adds qwen4exp MTP draft (`--spec-type draft-mtp`): loads the 1-layer 4B MTP block (31 `mtp.*` tensors, ~7.7 GB BF16) from a grafted main GGUF or a sidecar `-md` file.
++- **4 community MTP-head GGUFs published** (jlkivey, dzannotti, quimmedes, ashbash/MLX). Patch and head must be paired (incompatible layouts).
++- Community-verified: **+30–90% t/s on code/structured**, ~neutral on prose; `--spec-draft-n-max 3 --spec-draft-p-min 0.75`; head ≈ +2.5 GB (Q4_K_M).
++- **No published DGX Spark + llama.cpp + MTP run yet** — open opportunity.
++- Lesson: the llama.cpp qwen4exp ecosystem moved in days; conclusions about unmerged-PR-era capability go stale fast. Also: I under-researched the MTP *head* existence — it's in the BF16 source and NVFP4 alike; "absent from the Unsloth GGUF" ≠ "doesn't exist".
++
++
++## Phase 12 — MTP implemented & benchmarked on spark1 (2026-08-29)
++
++After the Phase 11 correction, actually ran it:
++
++1. Rebuilt llama.cpp on spark1 from **PR #27836** (`git fetch origin pull/27836/head:pr27836` → `1d8de7c1b`, build 10667, sm_121 CUDA).
++2. Downloaded jlkivey's MTP head (`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`, 4.1 GB, 34 tensors) + `graft-mtp-shard.py`; grafted onto our UD-Q4_K_XL split → `...-MTP-0000{1..5}-of-00005.gguf` (head as trailing shard, `block_count 48→49`, `nextn_predict_layers=1`); `--verify` PASSED (1256 tensors).
++3. Served with `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 -fa on` + our PLE-on-disk config; log confirmed "creating MTP draft context against the target model". Memory ~107/121 G.
++4. **A/B on identical build/model (parallel 1, 256-token gens)**:
++
++| | code | prose |
++|---|---|---|
++| plain (`--spec-type none`) | 27.4 t/s | 27.3 t/s |
++| **draft-mtp** | **32.1 t/s (+17%)** | 27.1 t/s (neutral) |
++
++MTP helps code/structured, ~neutral on prose — matches the community pattern (they saw +30–90% code on Metal/ROCm with q8_0 KV/mlock). First published DGX Spark + llama.cpp + MTP run. Scripts: `spark_serve_mtp.sh` (MTP), `spark_serve_mtp_plain.sh` (baseline; one-flag swap).
++
++**Tuning sweep** (q8_0 KV / n-max 2 vs 3): q8_0 KV consistently lowered code speed (32.1 → ~29.3 t/s), prose within noise (±10%); n-max 2 ≈ n-max 3. **Best config stays f16 KV + n-max 3** (code +17%).
++
++
++## Phase 12b — second UMA softlock & auto-reboot (2026-08-29)
++
++After the tuning sweep, restarting the MTP server wedged the box again: ICMP responded (0.1 ms), sshd couldn't send its banner, `spark2` unaffected. Auto-rebooted after ~10 min (`up 1 min`). Trigger pattern: server restart while the page cache is full of the model + a fresh ~100 GB CUDA allocation on the 121 GiB pool. Everything survived (NVMe); MTP server relaunched cleanly (113/121 G used, 8 G avail, health OK). Recurring failure mode on UMA — keep ≥8 GB headroom and expect occasional reboot-on-restart; `drop_caches` before load would help but needs root (no sudo on maci).
++
++
++## Phase 13 — SGLang TP2 deployment (goal mode) — status 2026-08-29
++
++**Staged on `spark1` (all done):** MiaAI recipe (`~/Qwen3.8-Flash-Next-Dual-DGX-Sparks`) cloned + reviewed; `.env` configured (CX rail 10.0.1.1/10.0.1.2, `enp1s0f1np1`/`rocep1s0f1` both, 1M ctx YaRN, NVFP4 KV, mem-fraction 0.82, NEXTN 3/1/4); patched image `qwen38flashnext-dspark:local` built on both nodes; NVFP4 weights (135.25 GB, 419 files, public repo) downloaded + verified on head and rsync'd to worker at ~350 MB/s over the CX7 rail. Two local fixes: `start.sh` patched to exclude the root-owned HF `trees/` cache dir from the weight rsync; page cache can be dropped without sudo via `docker run --rm --privileged --pid=host lmsysorg/sglang:qwen38flashnext sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'` (verified on spark1: 112 GB → 0).
++
++**Blocker:** `spark2` wedged (UMA softlock — kernel pings at 0.3 ms, sshd banner times out on both LAN and CX IPs, no auto-reboot after 25+ min). TP2 cannot boot without it → needs a **physical power cycle**.
++
++**Resume (one command after power cycle):**
++```bash
++# on spark1: drop caches on both, then boot
++docker run --rm --privileged --pid=host lmsysorg/sglang:qwen38flashnext sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
++ssh spark2 'docker run --rm --privileged --pid=host lmsysorg/sglang:qwen38flashnext sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"'
++cd ~/Qwen3.8-Flash-Next-Dual-DGX-Sparks && ./start.sh serve   # idempotent; weights already synced
++```
++Then validate: `:8888` health, boot-log `max_total_num_tokens` ≥ 1M, throughput, NVFP4 KV pool.
++
++
++## Phase 14 — SGLang TP2 LIVE (2026-08-29/30)
++
++**Server up on 2× DGX Spark, fully Docker-contained.** MiaAI recipe, patched SM121 image (`qwen38flashnext-dspark:local`), TP2 over the CX7 rail (10.0.1.1:26400), OpenAI API on `:8888`.
++
++- Boot log proof: `max_total_num_tokens=2,056,576` (NVFP4 KV) / `1,332,352` (fp8 KV), `context_len=1048576` (**1M ✓**), `ple_offload_embedding=True`, NEXTN 3/1/4, chunked prefill 1024, radix cache on (64 cached tokens observed), CUDA graphs captured, FlashInfer autotune done.
++- Measured single-stream (timed curl, 300–600-token gens): **NVFP4 KV ~36 t/s; fp8_e4m3 KV ~38–42 t/s**. First request after boot is slower (~28 t/s, kernel warmup).
++- Blocker resolved: spark2's vLLM DeepSeek-V4 container was stopped (`docker stop vllm-ds4-0731`, reversible) to free the node; page caches dropped via privileged docker (`docker run --rm --privileged --pid=host lmsysorg/sglang:qwen38flashnext sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'`) — no sudo needed.
++- Currently running: **fp8_e4m3 KV** (best measured performance). NVFP4 KV = one `.env` flip (`NVFP4_KV_CACHE=1`) for max KV headroom (2M pool).
++- Remaining A/B candidates (docs/sglang-perf.md): `--enable-linear-replayssm-spec`, `--speculative-attention-mode decode`, `--sampling-backend pytorch`, dual-rail NCCL (10.0.2.x rail), `--enable-overlap-schedule`.
++
++
++## Phase 15 — Performance tuning complete (2026-08-30)
++
++A/B results on the patched SM121 image, TP2 @1M:
++
++| Change | Aggregate output (24c) | E2E | Single-stream | Kept? |
++|---|---|---|---|---|
++| baseline (NVFP4 KV) | — | — | ~36 t/s | — |
++| fp8_e4m3 KV | 138.6 tok/s | 15.8 s | ~38–42 t/s | ✅ |
++| + `--speculative-attention-mode decode` | **147.6–155.2** | 12.7–14.3 s | **~40–44 t/s** | ✅ **FINAL** |
++| dual-rail NCCL (both CX7 rails) | — | — | — | ❌ reverted (recipe preflight is single-device) |
++
++**Final running config**: fp8_e4m3 KV + spec-attn-mode decode + NEXTN 3/1/4 + NCCL channel tuning, single CX7 rail, `qwen38flashnext-dspark:local` image on both nodes, API `http://spark1:8888`, `max_model_len=1,048,576`, pool 1,254,528 tokens. NVFP4 KV (2,056,576 pool) is one `.env` flip away (`NVFP4_KV_CACHE=1`).
++
++
++## Phase 16 — Documentation pass (2026-08-30)
++
++Full doc set for the SGLang deployment published:
++
++- **`docs/sglang-deployment.md`** (new) — reproducible runbook: SM121 patched-image rationale, `.env` (all values), the two local fixes (rsync trees-exclude via `scripts/patch_miaai_rsync.py`, privileged-Docker page-cache drop without sudo), boot/resume, validation checklist, measured results, gotchas.
++- **`scripts/sglang/.env.example`** (new) — the exact working `.env` (no secrets).
++- **`README.md`** — restructured as a two-stack project (SGLang NVFP4 TP2 flagship + llama.cpp GGUF fallback) with the measured tables.
++- **`docs/plan.md`** — Plan A marked DONE with outcomes.
++- **`docs/sglang-perf.md`** — final A/B numbers (fp8 + spec-attn-mode decode = 147.6–155.2 agg / ~40–44 t/s single; NVFP4-KV 2.06M pool option).
++
++Live state at close: SGLang TP2 up on both Sparks (`spark1:8888`, `max_model_len=1,048,576`, pool 1,254,528 fp8), 105/121 GB used per node, 16 GB available each.
++
++
++## Phase 17 — Lever A/B series complete (2026-08-30)
++
++Tested all remaining perf levers (each = base config + one lever, 24 concurrent, same bench):
++
++| Lever | Aggregate (24c) | Verdict |
++|---|---|---|
++| `NCCL_MAX/MIN_NCHANNELS` 4→8 | 150.9 | neutral (kept) |
++| `--schedule-conservativeness 0.5` | 162.1 | ✅ helps alone |
++| `--sampling-backend pytorch` | 163.4 | ✅ helps alone |
++| **`--enable-linear-replayssm-spec`** | **183–234** | ✅✅ **winner** |
++| all three combined | 193.2 | ❌ negative interaction |
++| `--enable-overlap-schedule` | fails to boot | ❌ PLE constraint confirmed |
++
++**Final running config**: fp8 KV + `--speculative-attention-mode decode --enable-linear-replayssm-spec` + NCCL8. Pool 1,232,832 (1M ✓). Single-stream up to ~81–103 t/s; aggregate band 183–234 (run-to-run variance ±25%). Scripts `scripts/sglang_ab.sh` / `scripts/sglang_ab_all.sh` reproduce the A/B harness. Full table in `docs/sglang-perf.md`.
++
++
++## Phase 18 — Softlock #4 + NCCL GID drift (2026-08-30)
++
++- **Incident**: after the A/B benchmark marathon, `spark1` softlocked (4th UMA softlock of the session — kernel pings, sshd starved). User power-cycled it.
++- **Recovery boots failed twice with NCCL errors** ("remote process exited" / "unhandled system error"). Root cause: **GID-table drift after the reboot** — the recipe hardcodes `NCCL_IB_GID_INDEX=3`; post-reboot, spark1's GID 3 was a valid link-local address but **spark2's GID 3 was empty** (asymmetric tables; the IPv4 GIDs also sat at different indices: 4 vs 5).
++- **Fix**: removed `NCCL_IB_GID_INDEX` from the recipe's NCCL env entirely (`sed -i '/NCCL_IB_GID_INDEX=/d' start.sh`) — **NCCL auto-selects a usable RoCEv2 GID**. Verified: clean boot (~600 s), pool 1,264,128 (>1M), completion OK.
++- **Ops rule going forward**: never pin `NCCL_IB_GID_INDEX` on this setup; the tables drift across reboots. Also: expect a ~10-min boot + possible NCCL hiccup after any host reboot (drop caches first; the GID auto-fix makes reboots safe).
++
++
++## Phase 19 — Post-recovery verification (2026-08-30)
++
++Server recovered and re-verified after the softlock + GID fix:
++
++- **API**: `spark1:8888` up, model `Qwen3.8-Flash-Next-NVFP4`, `max_model_len=1,048,576`.
++- **KV pool**: 1,264,128 tokens (>1M ✓) with the final config (fp8 KV + spec-attn-decode + replayssm-spec + NCCL8, GID pin removed).
++- **Completion**: works (thinking trace + answer).
++- **Memory steady-state**: spark1 105/121 GB used, spark2 104/121 used, **~16 GB available per node** (~32 GB cluster-wide), ~47 GB reclaimable buff/cache.
++- Cluster stable; the NCCL auto-GID fix makes future reboots safe (drop caches first, ~10-min boot).
++
++
++## Phase 20 — "Seems stuck" diagnosis: it's the thinking mode (2026-08-30)
++
++- User reported requests "stuck". Server was healthy (my own request returned in 8 s); the log showed `Received output ... state was deleted in TokenizerManager` = **client-side timeouts aborting requests**, not a server hang.
++- Root cause: the model **thinks by default** (xhigh effort) — tiny prompts like "hi" spend the whole budget on a reasoning trace with empty `content`, and pay ~8 s of TTFT+thinking overhead.
++- Fix (client-side, instant): `"chat_template_kwargs": {"enable_thinking": false}` → **0.39 s** with a direct answer; `"reasoning_effort": "low"` → 1.2 s with a short trace. Longer generations still run at ~80–100 t/s after first tokens.
++- Optional server default (10-min reboot): `--default-chat-template-kwargs '{"enable_thinking": false}'` (tonyd2wild's launcher does this) — not applied; thinking stays opt-in via the same kwargs.
++
++
++## Phase 21 — Back to single-Spark llama.cpp; SGLang TP1 feasibility (2026-08-30)
++
++- SGLang TP2 cluster shut down (`./stop.sh`, both nodes clean). Single-Spark **llama.cpp MTP server restored** on `spark1:8080` (grafted UD-Q4_K_XL MTP GGUF, PR #27836 build, 16K×1, f16 KV, `draft-mtp` n-max 3) — verified: "Hello!" in 2.1 s, MTP draft context active, 113/121 GB used.
++- **SGLang single-Spark (TP1) feasibility**: NVFP4 checkpoint = 126 GiB total (PLE FP8 = 47.7 GiB, non-PLE = ~78 GiB). TP1 fits 121 GiB **only with PLE offloaded**: host-pinned (`--ple-offload-embedding`, merged; same UMA pool, out of the CUDA static pool) ≈ 104–119 GiB knife-edge; **or streamed from SSD** (non-resident) ≈ 78 GiB + KV → comfortable.
++- **PLE-from-SSD in SGLang**: shipped option = host-pinned RAM only. True NVMe streaming = **open PR sgl-project/sglang#36567** (unmerged; patchable into the SM121 image like our existing patches). Community single-Spark SGLang NVMe-PLE datapoint: ~14–15 t/s (no MTP); vLLM's 181-agg run used the same PLE-mmap-off-NVMe pattern. llama.cpp's `-ot "per_layer_token_embd.weight=CPU"` + mmap remains the only *shipped* disk-streaming path (working, ~25–32 t/s with MTP).
++
++
++## Phase 22 — sglang#36567 applied: single-Spark SGLang with PLE from NVMe (2026-08-30)
++
++- **PR [sgl-project/sglang#36567](https://github.com/sgl-project/sglang/pull/36567)** ("stream PLE embeddings from NVMe") applied to the patched image. Scope: the PLE-NVMe feature only (TP1, FP8 PLE); the PR's alternative SM121 QSA-decode kernel was **skipped** to avoid colliding with the DSpark SM121/NVFP4-KV decode patches.
++- **Integration**: new module `qwen4_ple_nvme.py` (626 lines) + `apply_ple_nvme_patches.py` (anchor-based, mirrors MiaAI's own patch style) wired into the image Dockerfile; rebuilt → `qwen38flashnext-dspark:local` (sha `aeeb8d3c`). Files in `scripts/sglang/`.
++- **Boot proof**: `Qwen4 PLE NVMe table: 47.68 GiB across 10 files (320001536 rows)` — the n-gram table is read from the safetensors on disk, not allocated. Model load ~4 min (vs ~10 min TP2 — no 47.7 GiB PLE load).
++- **Launch**: `scripts/sglang/spark_serve_tp1_nvme.sh` — TP1, NVFP4, `SGLANG_QWEN4_PLE_NVME_BACKEND=mmap` (no Rust build; io_uring is the PR's primary backend and needs the Rust ext + seccomp allowance), NEXTN 3/1/4, CUDA graphs off (per the PR example).
++- **Measured**: 256-token code gen = **20.6 t/s** single-stream; memory 105/121 used / 16 avail (PLE not resident). The community's only prior single-Spark SGLang NVMe-PLE datapoint was 14–15 t/s (no MTP) — we beat it with NEXTN on.
++- **Remaining**: io_uring backend (build the `sglang-storage` Rust ext + `--security-opt seccomp=unconfined`), higher context than 32K, CUDA graphs with the NVMe prefetch overlap, and re-adding the PLE-NVMe env to the recipe `.env` for a managed launch.
++
++
++## Phase 22b — TP1 NVMe-PLE benchmark (2026-08-30)
++
++| Metric | Value |
++|---|---|
++| Single-stream (600-tok code gen) | **21.5 t/s** (256-tok: 20.6) |
++| Aggregate @ rate-8, 24 prompts | ~18.9 tok/s — serialized (`max_running_requests=1` per the PR recipe) |
++| E2E mean (queued) | ~94 s |
++| Memory | 104/121 used, 16 avail, ~17 GB page cache (PLE rows cached on read) |
++| Boot | ~4 min (no 47.7 GiB PLE load) |
++
++PLE residency check: `used` 104 GB excludes the 47.7 GiB table (mmap'd; only touched rows enter page cache). Comparison: llama.cpp GGUF MTP single-Spark = ~27–32 t/s (4-bit quality) vs this = ~21 t/s (NVFP4 quality, true NVMe streaming). Tuning room: io_uring backend (Rust ext + seccomp), raise `--max-running-requests`, re-enable CUDA graphs, larger ctx.
++
++
++## Phase 22c — TP1 concurrency scaling + PLE cache semantics (2026-08-30)
++
++**max_running_requests scaling** (262K ctx, NVMe-PLE mmap backend, NEXTN): N=1 → 18.9 tok/s aggregate; N=4 → **43.0**; N=8 → **50.7**. Single-stream ~31 t/s warm. Sweet spot ~4–8; diminishing returns beyond 4 (the NVMe PLE gather and single-GPU compute become the limit).
++
++**"Some n-grams in RAM, some from disk?" — two mechanisms:**
++1. **Already implicit with the mmap backend**: reads go through the OS page cache — hot rows stay resident (reclaimable), repeats hit RAM, the rest stays on the NVMe. No explicit control.
++2. **Explicit knob (io_uring backend)**: `SGLANG_QWEN4_PLE_NVME_CACHE_PAGES=N` — an app-level LRU of 4096-byte pages: ~N×4 KB of hot rows pinned in RAM while the rest streams from disk. E.g. 16 GiB budget → 4,194,304 pages. Requires the io_uring Rust extension + permissive container seccomp. N-gram rows are Zipfian, so a cache catches the frequent n-grams.
++
++Context: native 262K confirmed from the checkpoint config (`text_config.max_position_embeddings = 262144`), GGUF metadata, and the model card; 1M = YaRN extension (what the TP2 deployment used).
++
++
++## Phase 22d — TP1 final config: 1M ctx + NVFP4 KV + ~2M pool (2026-08-30)
++
++Single-Spark SGLang TP1 NVMe-PLE, final configuration (env-driven, `scripts/sglang/spark_serve_tp1_nvme.sh`):
++
++- **1M ctx** via YaRN (`--json-model-override-args` factor 4 + `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`), **NVFP4 KV** (`--kv-cache-dtype nvfp4` — user requirement), PLE streamed from NVMe (mmap backend), NEXTN 3/1/4, CUDA graphs off.
++- **KV pool ladder at 1M ctx**: bf16 454,592 → fp8_e4m3 899,776 → nvfp4 1,521,408 (mem 0.84) → **nvfp4 1,900,672 (mem 0.88)** — ≈2M as requested.
++- **Concurrency**: `max_running_requests` auto-clamps — 2 at mem 0.84, **4 at mem 0.88**. The binding limit at full 1M ctx is the **GDN/mamba state pool**, not the KV pool; more concurrent clients need shorter per-client contexts (e.g. 8× 262K) sharing the big pool.
++- Memory 109/121 used / 12 avail (0.88 fits; no earlyoom). Sanity completion OK (~2.8 s). Boot ~11 min at 1M.
++
++
++## Phase 23 — Full documentation pass (2026-08-30)
++
++Final state of everything:
++
++**Was live (spark1:8888)**: single-Spark SGLang TP1, NVFP4 checkpoint, PLE n-gram table streamed from NVMe (47.68 GiB off-RAM), 1M ctx (YaRN), NVFP4 KV, pool 1,900,672 tokens, 4 concurrent, NEXTN 3/1/4, ~31 t/s single-stream. Memory 109/121, 12 avail. Stopped to free the nodes for vLLM TP2 (Phase 24). Llama.cpp GGUF MTP server: stopped; SGLang TP2 cluster: stopped.
++
++**Host config note**: this machine's Kimi Code `~/.kimi-code/config.toml` was updated (`support_efforts = ["low","medium","xhigh"]` + `default_effort = "low"` on `vllm-local/Qwen3.8-Flash-Next-NVFP4` and the `omniroute` variant) so the harness exposes effort levels instead of a bare on/off toggle. Backed up as `config.toml.20260830-022250.bak`; apply via `/reload`. This is a host-local change, not in the repo.
++
++**Stack summary (all documented in this repo)**:
++1. SGLang NVFP4 TP2 (2× Spark, 1M ctx, 183–234 agg) — the flagship, stopped.
++2. SGLang TP1 NVMe-PLE (1 Spark, 1M ctx, ~50 agg) — the single-Spark NVFP4 path, stopped.
++3. llama.cpp GGUF MTP (1 Spark, 4-bit, ~32 t/s) — the light fallback, stopped.
++4. **vLLM TP2 (2× Spark, 512K, 31 t/s / 74 agg) — live at spark1:8000** (Phase 24).
++5. GLM-5.3-Flash feasibility — separate project.
++
++
++## Phase 24 — vLLM TP2 across 2× Spark: the Ray/NCCL/CUDA-graph gauntlet (2026-08-30)
++
++Goal (user): serve Qwen3.8-Flash-Next with **vLLM tensor-parallel-2 across both DGX Sparks**, NVFP4, PLE from NVMe, 1M ctx; compare vs SGLang TP2 (183–234 agg).
++
++**Stack chosen**: `blazux/qwen3.8-Flash-DGX` patched image (the only vLLM build that runs qwen4_exp on GB10 — stock `vllm/vllm-openai:qwen38-flash-next-arm64-cu130` does NOT work; qwen4_exp support exists only as open PR vllm#53896, not in any release). KV in this vLLM is **bf16-only** for qwen4_exp (QSA refuses fp8/nvfp4) → ~30 GiB per 1M ctx → concurrency memory-bound (~7.7× at 512K per the run). **Launch script: `scripts/vllm_tp2.sh`** (run `RANK=0` on spark1, `RANK=1` on spark2; API on spark1:8000).
++
++### The five failures and their fixes (all real, all reproduced)
++
++1. **`Failed to import Ray`** — the blazux image ships no Ray. Fix: `pip install --no-deps ray` (2.58.0) into the image, `docker commit` → `qwen38-flash-dgx-ray`, streamed to spark2 via `docker save | gzip | ssh spark2 'gunzip | docker load'`. Gotcha: the commit inherited the builder container's overridden entrypoint (`bash`), silently breaking the image's `ENTRYPOINT ["vllm","serve"]` → relaunch needed `--entrypoint vllm ... serve <snapshot> ...`.
++2. **`No node info found matching attributes: ''`** — ray 2.58 resolves the *driver's* node by scanning **local raylet sockets** (`find_node_ids()` reads `/tmp/ray` in the driver's own container). A driver with no local `ray start` finds zero sockets → polls forever → raises. Fix: run `ray start` in the same container as the driver. Related: `RAY_ADDRESS=10.0.1.1:6379` is mandatory (`address="auto"` probes 127.0.0.1:6379, which the head doesn't bind → silently starts a bogus single-node local cluster).
++3. **Cluster-ID churn** — Ray head inside the vLLM container: every engine-core failure exits the container, Docker restarts it, ray generates a **new cluster ID**, spark2's raylet dies with `GCS returned an authentication error`, and the next engine retry hits `ActorHandleNotFoundError` (job 34→35). Fix: **stable-cluster topology** — dedicated `qwen38-rayhead` container (`--num-gpus=0`, control plane only, never exits), vLLM container joins as a ray worker node owning spark1's GPU, spark2 joins as before. Engine failures now only restart the vLLM container; the cluster survives. The script reuses an existing rayhead (recreating it would regenerate the cluster ID again).
++4. **`Failed to initialize any NET plugin`** → `ibv_create_cq ... Cannot allocate memory` — two docker facts: `--gpus all` does **not** inject `/dev/infiniband`, and the default memlock ulimit is **8 MB** (RDMA CQ allocation fails with ENOMEM). Fix: `--device /dev/infiniband/rdma_cm --device /dev/infiniband/uverbs0..2` + `--ulimit memlock=-1 --ulimit stack=67108864`. Verified end-to-end with a standalone 2-node torch `all_reduce` over the CX rail: `NCCL INFO Init timings - ncclCommInitRank: rank 0/1 nranks 2 total 1.72s (connections 1.50s)`.
++5. **`Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned`** — the PLE gather is a CPU op + a pageable host→device copy and MUST run outside the CUDA graph. The blazux recipe declares it (and the attention/mamba family) as **splitting ops** (PIECEWISE, never FULL). Our first config lacked splitting_ops → the PLE lookup got captured → first a pinned-copy assert, then (with `cudagraph_copy_inputs:true`) a stride assert (`size 3==3, stride 8192==8193`). Nested `-cc.splitting_ops='[...]'` arrives as a *string* in this vLLM build and pydantic rejects it; the working form is the full-dict `--compilation-config '{"cudagraph_mode":"PIECEWISE","splitting_ops":[...12 ops incl. "vllm::ple_mmap_lookup"],"cudagraph_capture_sizes":[1,2]}'`.
++
++### Boot facts (final configuration)
++
++- Containers: `qwen38-rayhead` (ray head, 0 GPU) + `qwen38-vllm-tp2-r0` (ray node + driver + shard 0) on spark1; `qwen38-vllm-tp2-r1` (ray node, shard 1 actor) on spark2. All `--network host` (CX rail IPs 10.0.1.1/10.0.1.2), `--cap-add SYS_PTRACE --cap-add IPC_LOCK`, PLE mmap env (`VLLM_PLE_MMAP=1`, workers 64), NCCL env (IB over `rocep1s0f1`, no GID pin — auto-select after the GID-drift lesson).
++- 512K ctx default, YaRN factor 2.0 (4.0 @ 1M) via `--hf-overrides`; MTP spec 3; chunked prefill 8192; `--long-prefill-token-threshold 4096`; prefix caching on; `--kv-cache-dtype auto` (bf16 for qwen4_exp); PIECEWISE cudagraphs with the 12-op `splitting_ops` list from the blazux recipe (PLE lookup outside the graph).
++- Boot: NCCL comm init OK on both ranks (~1.7 s), model shards loaded (206 safetensors per node, ~4 min from NVMe), torch.compile cache (~20 s), **GPU KV cache 3,978,885 tokens → 7.77× concurrency @ 512K**.
++- PLE mmap confirmed live on both workers (`vllm_ple_mmap.py` stats lines; `PLE mmap patch applied to ...Qwen3_8FlashNextNGramEmbedding`).
++
++### Status — LIVE
++
++- API: `http://192.168.0.211:8000/v1` · model `qwen3.8-flash-next` · `max_model_len` 512000.
++- NCCL: `Using network IB` / `NET/IB : Using [0]rocep1s0f1:1/RoCE` on both ranks.
++- GPU KV cache: **3,980,387 tokens → 7.77× @ 512K**.
++- Single-stream (code, 374 tok, 12.01 s): **31.14 t/s**.
++- 8 concurrent (128 tok each, 13.79 s wall): **74.28 tok/s aggregate**.
++- Memory: spark1 117/121 used / 4 avail; spark2 111/121 used / 9 avail.
++- See `docs/vllm-perf.md`. Below SGLang TP2 (40–44 single / 183–234 agg) as expected: bf16 KV, PLE from disk, PIECEWISE graphs. In the same single-stream ballpark as SGLang TP1 NVMe-PLE (~31) and llama.cpp MTP (~27–32).
+diff --git a/docs/targets/qwen3.8-flash-next/sglang-deployment.md b/docs/targets/qwen3.8-flash-next/sglang-deployment.md
+new file mode 100644
+index 000000000..d7a078436
+--- /dev/null
++++ b/docs/targets/qwen3.8-flash-next/sglang-deployment.md
+@@ -0,0 +1,101 @@
++# SGLang NVFP4 TP2 Deployment — Qwen3.8-Flash-Next on 2× DGX Spark
++
++Status: **validated 2026-08-30**, currently **stopped** (the two Sparks are running vLLM TP2 — see [`docs/vllm-perf.md`](vllm-perf.md)). OpenAI API when this stack is up: `http://<head>:8888`, 1M context, NVFP4 checkpoint, fully Docker-contained.
++
++## What this is
++
++The full-quality path for Qwen3.8-Flash-Next: the **NVFP4 checkpoint** (`RadixArk/Qwen3.8-Flash-Next-NVFP4`, 135 GB, experts-only W4A4 quant, in-band with BF16 on GSM8K/AIME) served by **SGLang TP2 across 2× DGX Spark** over a direct CX7 RoCE rail. This is the stack the community proved at 47–70 t/s; our measured numbers below.
++
++## Why a patched image (the SM121 story)
++
++- SGLang qwen4_exp support merged Aug 26 (PR #36497) but is **not in any tagged release**; plain/nightly images are still **broken on GB10 (sm_121)**: TRT-LLM sparse decode silently corrupts long context on SM121 (120k–210k prompts → token-0 loop, sglang#36537), and the FA4 CuTe fallback doesn't compile on GB10. The SM121 Triton packed-QSA kernel (PR #36845) is **still open**.
++- Therefore the **MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks** recipe is required: it builds a derivative image (`qwen38flashnext-dspark:local`) from `lmsysorg/sglang:qwen38flashnext` with (1) TRT-LLM excluded on SM121, (2) the Triton packed-varlen QSA fallback, (3) a QSA NVFP4-KV cache patch (not upstream).
++
++## Prerequisites (our verified config)
++
++- 2× DGX Spark (GB10, sm_121, 121 GiB usable each), **direct CX7 link** with RoCE: our pair uses `enp1s0f1np1`/`rocep1s0f1` both sides, IPs `10.0.1.1` (head) / `10.0.1.2` (worker), MTU 9000. (The recipe's default port names/IPs differ — set yours in `.env`.)
++- SSH head→worker (key-based; the NVIDIA Sync `spark2` alias re-pointed to the CX IP works).
++- Docker on both nodes. NVFP4 repo is **public** (no HF token).
++
++## .env (ours, exact)
++
++See [`scripts/sglang/.env.example`](../scripts/sglang/.env.example). Key values:
++
++```bash
++HEAD_CX7_IP=10.0.1.1   WORKER_CX7_IP=10.0.1.2
++HEAD_CX7_IF=enp1s0f1np1   WORKER_CX7_IF=enp1s0f1np1
++HEAD_CX7_IB=rocep1s0f1   WORKER_CX7_IB=rocep1s0f1
++WORKER_HOST=spark2
++MEM_FRACTION_STATIC=0.82
++CONTEXT_LENGTH=1048576          # 1M ctx (YaRN factor 4 injected)
++CHUNKED_PREFILL_SIZE=1024       # must stay 1024 at 1M
++SPEC_STEPS=3  SPEC_TOPK=1  SPEC_DRAFT=4   # NEXTN; steps 4 impossible
++NVFP4_KV_CACHE=0                # 0 = fp8_e4m3 (faster); 1 = NVFP4 KV (bigger pool)
++EXTRA_ARGS=--speculative-attention-mode decode --enable-linear-replayssm-spec
++NCCL_MAX_NCHANNELS=8  NCCL_MIN_NCHANNELS=8  NCCL_CUMEM_ENABLE=0
++NCCL_IGNORE_CPU_AFFINITY=1  TORCH_NCCL_ASYNC_ERROR_HANDLING=1
++```
++
++## Two local fixes we had to make
++
++1. **rsync tree-exclude**: a root-owned HF `trees/*.json` cache file (leftover from a container run) made the weight rsync fail with code 23. Patched `start.sh`'s rsync to `--exclude 'trees/'` (`scripts/patch_miaai_rsync.py`). The trees dir is optional HF metadata, not weights.
++2. **Page-cache drop without sudo** (required before every boot — the 135 GB rsync page cache otherwise trips SGLang's per-rank memory-balance check / can softlock the box):
++   ```bash
++   docker run --rm --privileged --pid=host lmsysorg/sglang:qwen38flashnext \
++     sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
++   ```
++   Run on both nodes.
++
++## Boot / resume (one command, idempotent)
++
++```bash
++ssh spark1 'cd ~/Qwen3.8-Flash-Next-Dual-DGX-Sparks && ./start.sh serve'
++```
++First boot: pulls base image (~30 GB), builds patched image on both nodes, downloads 135 GB NVFP4 to the head, rsyncs to the worker over the CX rail (~350 MB/s), boots TP2, waits for readiness (~9–10 min total on warm cache), runs smoke. Weights + image are cached — subsequent boots skip to launch. `./start.sh stop|status|logs|smoke|kv-eval|doctor` also available.
++
++## Validation checklist (all passed)
++
++- `max_total_num_tokens` in the boot log ≥ 1,048,576 — ours: **1,254,528** (fp8+spec-attn-decode) / 1,332,352 (fp8) / **2,056,576 (NVFP4 KV)**.
++- `GET /v1/models` → `max_model_len: 1048576`.
++- Chat completion returns thinking trace + correct code answer.
++- `ple_offload_embedding=True` in server args (PLE table host-pinned, ~11 GB/rank, out of the CUDA static pool).
++
++## Measured results (2026-08-30, single-stream / aggregate)
++
++| Config | Single-stream | Aggregate output (24 conc) | E2E mean |
++|---|---|---|---|
++| NVFP4 KV | ~36 t/s | — | — |
++| fp8_e4m3 KV | ~38–42 t/s | 138.6 tok/s | 15.8 s |
++| fp8 + spec-attn-decode | ~40–44 t/s | 147.6–155.2 tok/s | 12.7–14.3 s |
++| **+ replayssm-spec (FINAL)** | **~81–103 t/s** | **183–234 tok/s (noisy band)** | 9.4–11.9 s |
++
++More in [`docs/sglang-perf.md`](sglang-perf.md).
++
++## Single-Spark SGLang with PLE streamed from NVMe (sglang#36567)
++
++The **NVFP4 checkpoint fits one Spark (121 GiB) if the 47.7 GiB FP8 PLE table is read from disk instead of loaded** (~78 GiB resident). Open PR [#36567](https://github.com/sgl-project/sglang/pull/36567) implements exactly that (TP1 only, FP8 PLE):
++
++- Applied to the patched image (see `scripts/sglang/apply_ple_nvme_patches.py` — feature only, not the PR's SM121 decode kernel). Boot log: `Qwen4 PLE NVMe table: 47.68 GiB across 10 files (320001536 rows)`.
++- Launch: `scripts/sglang/spark_serve_tp1_nvme.sh` — env `SGLANG_QWEN4_PLE_NVME_PATH=<snapshot>`, `SGLANG_QWEN4_PLE_NVME_BACKEND=mmap|io_uring`.
++- Measured: **~21 t/s single-stream** (600-token code gen = 21.5), 104/121 GB used / 16 avail (PLE not resident), ~4-min boot. `max_running_requests=1` per the PR recipe serializes requests.
++- Note: io_uring backend needs the PR's `sglang-storage` Rust extension + a permissive container seccomp profile; mmap is the zero-build correctness path.
++
++## Gotchas / notes
++
++- **UMA softlocks**: booting under a full page cache wedges the box (kernel pings, sshd starved, ~10 min auto-reboot or manual power cycle). Always drop caches before boot. Four incidents logged.
++- **Do NOT set `NCCL_IB_GID_INDEX`** — the recipe originally hardcoded `=3`; GID tables drift across host reboots (spark2's GID 3 went empty after one reboot, breaking NCCL with "unhandled system error"). We removed the pin; NCCL auto-selects a valid RoCEv2 GID. Expect a clean ~10-min boot after any reboot.
++- **mem-fraction 0.85+** risks the DGX OS earlyoom SIGTERM — 0.82 is the validated 1M point.
++- **Dual-rail NCCL**: the recipe's preflight accepts a single RoCE device; dual-rail was tried and reverted (not worth patching for unverified ~2%).
++- **`--enable-torch-compile`**: breaks CUDA-graph capture on SM121 — keep off.
++- **NEXTN steps 4 is impossible** (draft=5 rejected by the compress-ratio cap); 3/1/4 is max.
++- **lmcache**: evaluated, deferred — hybrid-layout bugs open for qwen4_exp (LMCache #4771 etc.), and 1M fits without KV offload.
++- The user's vLLM DeepSeek-V4 container on the worker was paused to free the node (`docker start vllm-ds4-0731` to restore).
++
++## Reproduce
++
++1. Clone `MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks` on the head.
++2. Copy `.env.example` → `.env`, set your CX IPs/IF/IB + the values above.
++3. Apply the rsync patch (or the trees dir fix).
++4. `./start.sh serve` (drop caches first on both nodes).
++
++Sources: [MiaAI recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks), [sglang#36497](https://github.com/sgl-project/sglang/pull/36497), [#36845](https://github.com/sgl-project/sglang/pull/36845), [#36537](https://github.com/sgl-project/sglang/issues/36537), [#36796](https://github.com/sgl-project/sglang/issues/36796), [#36797](https://github.com/sgl-project/sglang/issues/36797), [tonyd2wild](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark), [pocharlies](https://github.com/pocharlies/qwen38-flash-next-dgx-spark-sglang).
+diff --git a/docs/targets/qwen3.8-flash-next/sglang-perf.md b/docs/targets/qwen3.8-flash-next/sglang-perf.md
+new file mode 100644
+index 000000000..77dcb4b47
+--- /dev/null
++++ b/docs/targets/qwen3.8-flash-next/sglang-perf.md
+@@ -0,0 +1,103 @@
++# SGLang TP2 Performance Tuning — Qwen3.8-Flash-Next NVFP4 on 2× DGX Spark
++
++Research date: 2026-08-30. Base: [MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks) recipe (patched SM121 image, 1M YaRN, NVFP4 KV, NEXTN 3/1/4, mem 0.82, chunk 1024) — measured 64.4 tok/s single-stream, 117 ×2, ~153–160 ×8. This doc = the deltas for maximum performance.
++
++## Image: stay on the patched derivative (as of 2026-08-30)
++
++- **sglang PR #36845 (SM121 packed-QSA Triton kernel) is NOT merged.** Plain `dev-cu13`/nightly is still NOT SM121-usable (TRT-LLM sparse decode silently corrupts long context on SM121; FA4 CuTe fallback doesn't compile on GB10). Keep `qwen38flashnext-dspark:local`.
++- When #36845 merges: same image, swap the generic Triton fallback for the KDA kernel → expected **~+4%** (measured 1.41–10.66× kernel-level, but only +4.0–4.45% E2E at c=1/4).
++- `--enable-torch-compile`: **off** (breaks CUDA-graph capture on SM121 — #36796). No fix seen.
++
++## Near-free wins to add to `.env` (verified sources)
++
++```bash
++# ---- NCCL / RoCE (NCCL is ~7% of decode; these are cheap real gains) ----
++NCCL_MAX_NCHANNELS=4
++NCCL_MIN_NCHANNELS=4
++NCCL_CUMEM_ENABLE=0
++NCCL_IGNORE_CPU_AFFINITY=1
++TORCH_NCCL_ASYNC_ERROR_HANDLING=1
++# dual rail — our pair HAS the second CX7 rail active (10.0.2.x, roceP2p1s0f1):
++HEAD_CX7_IB=rocep1s0f1,roceP2p1s0f1
++WORKER_CX7_IB=rocep1s0f1,roceP2p1s0f1
++NCCL_CROSS_NIC=1
++# verify in boot log: "network IB" (TCP fallback silently costs ~half)
++
++# ---- CUDA graph hygiene ----
++EXTRA_ARGS=--disable-prefill-cuda-graph --cuda-graph-max-bs 28 --disable-cuda-graph-padding
++```
++
++## Measured on our box (2026-08-30, TP2 @1M, patched image)
++
++| Config | Aggregate output (24 conc) | E2E mean | Single-stream |
++|---|---|---|---|
++| fp8_e4m3 KV (baseline) | 138.6 tok/s | 15.8 s | ~38–42 t/s |
++| fp8 + `--speculative-attention-mode decode` | 147.6–155.2 tok/s | 12.7–14.3 s | ~40–44 t/s |
++| **+ `--enable-linear-replayssm-spec` (FINAL)** | **183–234 tok/s (noisy band)** | 9.4–11.9 s | **~81–103 t/s** |
++
++**Single-Spark SGLang TP1 with PLE streamed from NVMe** (sglang#36567, mmap backend, NEXTN 3/1/4, CUDA graphs off, 262K ctx):
++
++| max_running_requests | Aggregate output | Single-stream |
++|---|---|---|
++| 1 | 18.9 tok/s (serialized) | ~21 t/s (first-boot cold) |
++| 4 | **43.0 tok/s** | ~31 t/s (warm) |
++| 8 | **50.7 tok/s** | — |
++
++**Final TP1 config (1M ctx, NVFP4 KV, PLE from NVMe)**: `MEM_FRACTION=0.88`, `MAX_RUNNING=4` (auto-clamped — the GDN/mamba state pool is the concurrency limit at full 1M ctx, not the KV pool), pool **1,900,672 tokens** (~2M-class), memory 109/121 used / 12 avail.
++
++**KV-dtype pool ladder at 1M ctx** (mem 0.84 unless noted): bf16 454K → fp8_e4m3 900K → **nvfp4 1.52M** → **nvfp4 1.9M @ mem 0.88**. `max_running_requests`: 2 @ mem 0.84 → 4 @ 0.88 (mamba/GDN state pool scales with the fraction).
++
++Sweet spot ~4–8 concurrent (1→4 = +128%, 4→8 = +18%; bottleneck shifts to the NVMe PLE gather / single-GPU compute). Memory 105/121 used / 16 avail — the 47.7 GiB PLE table is not resident. vs llama.cpp single-Spark GGUF MTP (~27–32 t/s): SGLang TP1 trades ~speed for NVFP4 quality + true NVMe streaming. Tuning room: io_uring backend, `SGLANG_QWEN4_PLE_NVME_CACHE_PAGES` LRU (see below), CUDA graphs, 1M ctx via YaRN.
++
++## Lever A/B series (2026-08-30, each = base + one lever, 24 concurrent)
++
++| Lever | Aggregate (24c) | E2E | Verdict |
++|---|---|---|---|
++| baseline (spec-attn-decode) | 147.6–155.2 | 12.7–14.3 | — |
++| `NCCL_MAX/MIN_NCHANNELS` 4→8 | 150.9 | 12.8 | neutral (kept, harmless) |
++| `--schedule-conservativeness 0.5` | 162.1 | 13.9 | ✅ helps alone |
++| `--sampling-backend pytorch` | 163.4 | 12.4 | ✅ helps alone |
++| **`--enable-linear-replayssm-spec`** | **183–234** | 9.4–11.9 | ✅✅ **winner** (spec-verify memory 11.5→1.8 GB pays off on decode) |
++| all three combined | 193.2 | 10.6 | ❌ **negative interaction** — sched05/pytorch help *without* replayssm but hurt *with* it (233.6 → 193.2) |
++| `--enable-overlap-schedule` | — | — | ❌ **fails to boot** (recipe's PLE two-batch constraint confirmed) |
++| dual-rail NCCL | — | — | ❌ recipe preflight is single-device (reverted) |
++
++Run-to-run variance on this box is ±25% (same config re-measured 183–234); treat aggregate numbers as a band. Single-stream is prompt-dependent (the 600-tok short-prompt series is internally consistent).
++
++**FINAL config**: fp8_e4m3 KV + `--speculative-attention-mode decode --enable-linear-replayssm-spec` + NCCL channels 8, single CX7 rail, NEXTN 3/1/4.
++
++Dual-rail NCCL (both CX7 rails) was attempted — the recipe's preflight only accepts a single RoCE device, so it was reverted (not worth patching for an unverified ~2%). `--enable-torch-compile` stays off; NEXTN 3/1/4 is the max chain (steps 4 rejected).
++
++Pool at 1M: NVFP4 KV 2,056,576 · fp8_e4m3 1,332,352 · fp8+spec-attn-decode 1,254,528 · **final (replayssm) 1,232,832** (all >1M ✓). NVFP4 KV gives max headroom; fp8 is faster — flip = one `.env` line.
++
++## A/B matrix (run on our box once booted; all unmeasured on the patched Triton-fallback stack)
++
++| Knob | Default (MiaAI) | A/B | Why |
++|---|---|---|---|
++| KV dtype | NVFP4 (`NVFP4_KV_CACHE=1`, pool 2.85M) | `NVFP4_KV_CACHE=0` → fp8_e4m3 (pool 1.75M) | Issue #36797: stock NVFP4-KV = −29% decode vs fp8 on SM121; MiaAI's patched version claims 64.4 t/s — **no clean public A/B of the final patch exists; measure it.** fp8 still fits 1M (1.67×). |
++| `--enable-linear-replayssm-spec` | off | on | ReplaySSM spec-verify: spec-scratch 11.5→1.8 GB, `D=0` in mamba sizing; validated on tonyd2wild's TRT-LLM path only. |
++| `--speculative-attention-mode decode` | off | on | tonyd2wild uses it; no data on patched path. |
++| `--sampling-backend pytorch` | default | pytorch | part of tonyd2wild's token-0-fix stack; may be unneeded with the corrected kernel. |
++| `--enable-overlap-schedule` | off | on | #36796 ran with it; interaction with PLE two-batch overlap unclear. |
++| SPEC_STEPS | 3 | — | **4 is impossible** (draft=5 rejected: compress-ratio cap). 3/1/4 is max. |
++| PLE storage | pinned host (~11 GB/rank) | NVMe-mmap (`MADV_RANDOM`, evictable) | frees ~11 GB → ~+1M KV tokens; SGLang TP2 impact **unmeasured** (single-Spark no-MTP datapoint: 14–15 t/s); open PR sglang#36567 implements NVMe streaming. The vLLM 181-agg run used it. |
++
++## Throughput ceiling math (context vs concurrency)
++
++- **1M ctx caps concurrency ~14** (mamba/GDN state pool) — aggregate tops out near MiaAI's 117 ×2 / 153–160 ×8 territory only at lower concurrency.
++- **If aggregate > context**: 512K YaRN (factor 2) + 8–16 concurrent → pocharlies' measured **153–160 agg** (1.37M pool at mem 0.90, mamba-40).
++- `--mamba-track-interval 64` stays (granularity, not context cap); `--chunked-prefill-size 1024` stays at 1M (4096 wedges the box at 300k+ history — QSA indexer fp32 workspace).
++
++## Newer external measurements (for context, not directly comparable)
++
++- **181 agg tok/s (peak 195)** on 2× Spark — vLLM, 512K, PLE-mmap'd off NVMe, MTP k=3, 9 concurrent agent sessions (prismix, 08-28). Not SGLang.
++- **1M on ONE Spark** — vLLM, 989.7k-token request, 26.7 t/s decode, PLE-NVMe (sayyidfareed, 08-28/29).
++- **SM120 (RTX PRO 6000) TP2** — 127.8–128.3 t/s decode, 8.8–11.6K t/s prefill (not GB10).
++
++## Execute plan (once spark2 is power-cycled)
++
++1. Drop caches both nodes (privileged docker — see session-log Phase 13).
++2. `./start.sh serve` with the NCCL + graph-hygiene `.env` additions.
++3. Baseline: 64.4/117/153-style numbers + pool size in boot log.
++4. Run the A/B matrix (KV dtype first — it's the biggest lever per the −29% claim).
++5. Document measured deltas in this file.
+diff --git a/docs/targets/qwen3.8-flash-next/vllm-perf.md b/docs/targets/qwen3.8-flash-next/vllm-perf.md
+new file mode 100644
+index 000000000..a0bda1d94
+--- /dev/null
++++ b/docs/targets/qwen3.8-flash-next/vllm-perf.md
+@@ -0,0 +1,77 @@
++# vLLM TP2 on 2× DGX Spark — Qwen3.8-Flash-Next NVFP4
++
++Live stack (2026-08-30): `scripts/vllm_tp2.sh` on spark1 (`RANK=0`) + spark2 (`RANK=1`).
++Image `qwen38-flash-dgx-ray` (blazux/qwen3.8-Flash-DGX + `pip install --no-deps ray==2.58.0`).
++API: `http://192.168.0.211:8000/v1` · served name `qwen3.8-flash-next` · `max_model_len` 512000.
++
++## What this stack is
++
++vLLM tensor-parallel-2 over the CX7 RoCE rail (10.0.1.1 ↔ 10.0.1.2), PLE n-gram table mmapped from NVMe (`VLLM_PLE_MMAP=1`), MTP spec 3, YaRN factor 2.0 @ 512K. The only vLLM build that runs `qwen4_exp` on GB10 today — stock `vllm/vllm-openai:qwen38-flash-next-arm64-cu130` does not; upstream support is open PR [vllm#53896](https://github.com/vllm-project/vllm/pull/53896).
++
++**KV is bf16-only** for this architecture in vLLM (QSA refuses fp8/nvfp4). Pool observed: **3,980,387 tokens → 7.77× concurrency @ 512K**. Compare SGLang TP2, which can do NVFP4 KV and a 1–2M token pool at 1M ctx.
++
++## Measured (this session)
++
++| Run | Tokens | Latency | tok/s |
++|---|---|---|---|
++| Single-stream chat, code prompt, temp 0.2 | 374 completion / 75 prompt | 12.01 s | **31.14** |
++| 8 concurrent, 128-token completions | 1024 completion / 13.79 s wall | 13.79 s | **74.28 agg** (~9.6 t/s each) |
++
++NCCL: `Using network IB`, `NET/IB : Using [0]rocep1s0f1:1/RoCE`, channels via `NET/IB/0`. Init ~1.7 s (connections 1.50 s). Standalone 2-node `all_reduce` over the same env: `RANK0/1 NCCL OK [2.0 × 8]`.
++
++Memory after boot: spark1 117/121 used / 4 avail; spark2 111/121 used / 9 avail. PLE mmap confirmed on both workers (`vllm_ple_mmap.py` stats; `PLE mmap patch applied to ...Qwen3_8FlashNextNGramEmbedding`).
++
++## vs the other stacks (same model, same 2 Sparks)
++
++| Stack | Ctx | KV | PLE | Single t/s | Agg t/s | Notes |
++|---|---|---|---|---|---|---|
++| **SGLang TP2** | 1M | NVFP4 | host-offload | ~40–44 | 183–234 @ 24 conc | flagship quality + KV density |
++| **vLLM TP2** (this) | 512K | bf16 | NVMe mmap | **31.1** | **74 @ 8 conc** | MTP 3, 7.77× @ 512K |
++| SGLang TP1 NVMe-PLE | 1M | NVFP4 | NVMe mmap | ~31 | 43–51 @ 4 conc | one Spark |
++| llama.cpp GGUF MTP | 16K | f16 | CPU mmap | 27–32 | n/a | 4-bit weights |
++
++vLLM TP2 is in the same single-stream ballpark as SGLang TP1 and llama.cpp, well below SGLang TP2. The gap is expected: bf16 KV (no NVFP4 KV path), PLE from disk, and PIECEWISE graphs with the PLE lookup as a splitting op. 8-way concurrent already saturates decode (~9.6 t/s each, 74 agg).
++
++## Topology (do not collapse)
++
++```
++spark1  qwen38-rayhead        ray start --head --num-gpus=0     # control plane, never exits
++spark1  qwen38-vllm-tp2-r0    ray start --address && vllm serve # driver + shard 0
++spark2  qwen38-vllm-tp2-r1    ray start --address && sleep      # shard 1 actor
++```
++
++Ray 2.58 resolves the *driver's* node via local `/tmp/ray` sockets — the driver container must run its own `ray start`. Putting the GCS in the vLLM container is fatal: every engine failure regenerates the cluster ID and kills spark2's raylet (`GCS returned an authentication error` / `ActorHandleNotFoundError`).
++
++## Boot blockers (each one was a full restart)
++
++Documented with repros in `docs/session-log.md` Phase 24:
++
++1. No Ray in the blazux image → `qwen38-flash-dgx-ray` layer. Commit inherits the builder's `bash` entrypoint → `--entrypoint vllm ... serve`.
++2. Driver without a local raylet → `No node info found matching attributes: ''`. `address="auto"` starts a bogus single-node cluster; set `RAY_ADDRESS=10.0.1.1:6379`.
++3. Cluster-ID churn → dedicated `qwen38-rayhead` (`--num-gpus=0`); script reuses it if running.
++4. `--gpus all` does not inject `/dev/infiniband`; default memlock 8 MB kills `ibv_create_cq` → `--device /dev/infiniband/{rdma_cm,uverbs0,uverbs1,uverbs2} --ulimit memlock=-1`.
++5. PLE gather captured into the CUDA graph → pinned-copy, then stride (`8192==8193`) asserts. Fix: `--compilation-config` JSON with `cudagraph_mode=PIECEWISE` + 12-op `splitting_ops` (incl. `vllm::ple_mmap_lookup`). Nested `-cc.splitting_ops=...` is a string in this build and pydantic rejects it.
++
++Also: never pin `NCCL_IB_GID_INDEX` (drifts after reboots). `GPU_MEM=0.85` (0.875 OOM'd a 300k prefill + MTP). `--cap-add SYS_PTRACE --cap-add IPC_LOCK` (Yama ptrace + RDMA).
++
++## Knobs
++
++| Env | Default | Meaning |
++|---|---|---|
++| `CTX` | 512000 | 1000000 auto-sets YaRN factor 4.0 |
++| `MTP` | 3 | 0 = off |
++| `SEQS` | 16 | max concurrent sequences |
++| `GPU_MEM` | 0.85 | 0.80 for long-running |
++| `MASTER_ADDR` | 10.0.1.1 | CX rail IP of spark1 |
++
++## Reproduce
++
++```bash
++# both nodes already have qwen38-flash-dgx-ray
++scp scripts/vllm_tp2.sh spark1:~/vllm_tp2.sh
++scp scripts/vllm_tp2.sh spark2:~/vllm_tp2.sh
++ssh spark1 'RANK=0 bash ~/vllm_tp2.sh'
++ssh spark2 'RANK=1 bash ~/vllm_tp2.sh'
++# wait ~8–12 min
++curl -s http://192.168.0.211:8000/v1/models
++```
+-- 
+2.55.0
+

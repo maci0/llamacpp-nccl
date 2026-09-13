@@ -1,0 +1,6 @@
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | CUDA       |  99 |           pp256 |       633.26 ± 93.53 |
+| qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | CUDA       |  99 |            tg64 |         27.05 ± 1.33 |
+
+build: unknown (0)

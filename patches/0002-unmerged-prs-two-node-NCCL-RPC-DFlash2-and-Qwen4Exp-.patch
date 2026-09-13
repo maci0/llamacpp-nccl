@@ -1,0 +1,1980 @@
+From 58020575059d24e187db4d8cc8c14c413a6aa27a Mon Sep 17 00:00:00 2001
+From: "Marcel W. Wysocki" <maci.stgn@gmail.com>
+Date: Sun, 13 Sep 2026 11:35:58 +0800
+Subject: [PATCH 2/4] unmerged prs: two-node NCCL RPC, DFlash2 and Qwen4Exp
+ work
+
+Working-tree changes that had never been committed on this branch, so they existed in one checkout only.
+
+- ggml-rpc and rpc-server: two-node transport and server-side work
+- common/speculative, src/models/dflash: DFlash2 draft plumbing
+- src/models/qwen4exp, conversion/qwen4exp.py, gguf tensor mapping: Qwen3.8 draft head and model
+- scripts/start_rpc_spark.sh, run_qwen38_tp2.sh, build_spark.sh
+
+Assisted-by: Kimi Code
+---
+ common/common.cpp               |   9 +
+ common/speculative.cpp          |  38 +++
+ common/speculative.h            |   5 +
+ conversion/qwen4exp.py          |  70 +++-
+ ggml/include/ggml-cuda.h        |   6 +
+ ggml/include/ggml-rpc.h         |   2 +-
+ ggml/src/ggml-backend-meta.cpp  |  51 ++-
+ ggml/src/ggml-cuda/common.cuh   |  11 +
+ ggml/src/ggml-cuda/ggml-cuda.cu | 128 ++++++++
+ ggml/src/ggml-rpc/ggml-rpc.cpp  | 551 ++++++++++++++++++++++++++++++--
+ gguf-py/gguf/tensor_mapping.py  |  10 +
+ include/llama.h                 |   2 +
+ scripts/build_spark.sh          |  12 +
+ scripts/run_qwen38_tp2.sh       |  27 ++
+ scripts/start_rpc_spark.sh      |   7 +
+ src/llama-arch.cpp              |   7 +-
+ src/llama-arch.h                |   5 +
+ src/llama-model.cpp             |  12 +-
+ src/llama-model.h               |  10 +
+ src/models/dflash.cpp           |   8 +
+ src/models/models.h             |  11 +-
+ src/models/qwen4exp.cpp         | 340 +++++++++++++++++---
+ tools/rpc/rpc-server.cpp        |   2 +-
+ 23 files changed, 1232 insertions(+), 92 deletions(-)
+ create mode 100755 scripts/build_spark.sh
+ create mode 100755 scripts/run_qwen38_tp2.sh
+ create mode 100755 scripts/start_rpc_spark.sh
+
+diff --git a/common/common.cpp b/common/common.cpp
+index d162a3880..91bd86878 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1292,6 +1292,15 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
++    // DFlash2/DSpark drafters rank their full draft vocabulary inside the graph (top_k / argmax
++    // on the lm_head output), which needs the lm_head (the target's when the draft has none)
++    // replicated on every device. The flag must be set before the model is loaded, since the
++    // tensor split state is fixed during load.
++    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !params.speculative.draft.mparams.path.empty() &&
++            common_speculative_draft_ranks_full_output(params.speculative.draft.mparams.path)) {
++        mparams.output_replicated = true;
++    }
++
+     if (params.fit_params) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 2db381d58..88ee94807 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2318,6 +2318,44 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
+     return { type };
+ }
+ 
++bool common_speculative_draft_ranks_full_output(const std::string & path) {
++    struct gguf_init_params gguf_params = {
++        /* .no_alloc = */ true,
++        /* .ctx      = */ nullptr,
++    };
++
++    gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
++    if (!gguf_ctx) {
++        return false;
++    }
++
++    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
++    if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
++        return false;
++    }
++
++    const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
++    if (arch != "dflash") {
++        return false;
++    }
++
++    // DFlash2's candidate selector and DSpark's markov head rank the full draft
++    // vocabulary in-graph (top_k / argmax on the lm_head output)
++    bool ranks_full_output = false;
++    if (gguf_find_tensor(gguf_ctx.get(), "selector_hidden.weight") >= 0) {
++        ranks_full_output = true; // DFlash2
++    }
++    if (gguf_find_tensor(gguf_ctx.get(), "markov_w1.weight") >= 0) {
++        ranks_full_output = true; // DSpark
++    }
++    if (!ranks_full_output) {
++        return false;
++    }
++
++    // a draft with its own lm_head replicates it itself; only the shared target lm_head needs the flag
++    return gguf_find_tensor(gguf_ctx.get(), "output.weight") < 0;
++}
++
+ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_speculative_type> & configs) {
+     uint32_t result = 0;
+     for (size_t i = 0; i < configs.size(); i++) {
+diff --git a/common/speculative.h b/common/speculative.h
+index 22505891f..f29674dad 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -17,6 +17,11 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
+ // infer the spec types from the GGUF metadata of a draft model; empty if unknown
+ std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
+ 
++// returns true when the draft model ranks its full vocabulary inside the graph (DFlash2
++// candidate selector, DSpark markov head) and has no lm_head of its own, so the target's
++// lm_head must be replicated on every device under tensor parallelism
++bool common_speculative_draft_ranks_full_output(const std::string & path);
++
+ // convert string to type
+ enum common_speculative_type common_speculative_type_from_name(const std::string & name);
+ 
+diff --git a/conversion/qwen4exp.py b/conversion/qwen4exp.py
+index 168796d61..86f66e758 100644
+--- a/conversion/qwen4exp.py
++++ b/conversion/qwen4exp.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from typing import Iterable, cast
++from typing import Callable, Iterable, cast
+ 
+ import torch
+ from torch import Tensor
+@@ -9,25 +9,69 @@ import gguf
+ import numpy as np
+ 
+ from .base import ModelBase
+-from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
++from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin, _QwenMtpMixin
+ from .qwen3vl import Qwen3VLVisionModel
+ 
+ 
+ @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+ @ModelBase.example("Qwen/Qwen3.8-Flash-Next")
+-class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
++class Qwen4ExpTextModel(_QwenMtpMixin, _Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+     """Qwen3.8-Flash-Next.
+ 
+     Shares the Qwen3.5 gated delta net and interleaved mrope, and adds three things:
+     hyper-connections in place of every layer norm, QSA sparse attention on the full
+     attention layers, and PLE n-gram hash embeddings on a single layer.
++
++    The checkpoint also carries a NextN/MTP draft head under `mtp.*`, exported as a
++    trailing block; pass --no-nextn to leave it out.
+     """
+ 
+     model_arch = gguf.MODEL_ARCH.QWEN4EXP
+ 
+-    # the MTP block is a separate draft head; vLLM drops it too
+-    supports_mtp_export = False
+-    no_mtp = True
++    # The MTP head is one trunk-shaped block (dense attention + MoE, wrapped in
++    # hyper-connections) plus a combiner, so once _QwenMtpMixin renames
++    # `mtp.layers.0.*` to the trailing block index its tensors ride the existing
++    # qwen4exp mappings unchanged. Only the two head-level pieces below differ.
++
++    _MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."
++
++    @classmethod
++    def filter_tensors(cls, item):
++        # the head carries its own copy of the trunk's hc_head_* output mixer,
++        # which qwen4exp has in place of a final norm; it is unindexed in the
++        # checkpoint and per-block in the GGUF
++        name, gen = item
++        if name.startswith("model." + cls._MTP_MIXER_PREFIX):
++            name = name.replace("model.", "", 1)
++        if name.startswith(cls._MTP_MIXER_PREFIX):
++            if cls.no_mtp:
++                return None
++            assert cls._original_block_count is not None
++            return f"model.layers.{cls._original_block_count}.{name[len('mtp.'):]}", gen
++        return super().filter_tensors(item)
++
++    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
++        # qwen4exp splits the combiner the shared NextN code calls eh_proj into
++        # fc_embedding and fc_hidden; W_e@e + W_h@h == [W_e|W_h] @ concat(e, h),
++        # so the two fuse back into the single expected matmul
++        tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
++
++        emb = tensors.pop("mtp.fc_embedding.weight", None)
++        hid = tensors.pop("mtp.fc_hidden.weight", None)
++        if emb is None and hid is None:
++            return tensors
++        if emb is None or hid is None:
++            raise ValueError(
++                "the qwen4exp MTP combiner needs both mtp.fc_embedding.weight and "
++                "mtp.fc_hidden.weight; pass --no-nextn to convert without the draft head"
++            )
++
++        assert self._original_block_count is not None
++        # fc_embedding first: the graph concatenates the token embedding ahead of
++        # the hidden state, so the fused weight has to be ordered to match
++        name = f"model.layers.{self._original_block_count}.eh_proj.weight"
++        tensors[name] = lambda: torch.cat([emb(), hid()], dim=1)
++        return tensors
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -63,14 +107,18 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
+         ratio = hp["indexer_compress_ratio"]
+         layer_types = hp["layer_types"]
+-        self.gguf_writer.add_attention_compress_ratios(
+-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+-        )
++        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
++        # llama.cpp reads this array with length block_count, and the MTP blocks
++        # trailing the trunk attend densely, which is what a ratio of 0 selects
++        ratios += [0] * (self.block_count - n_layer)
++        self.gguf_writer.add_attention_compress_ratios(ratios)
+ 
+         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
+-        # so emit no PLE keys rather than optional ones
++        # so emit no PLE keys rather than optional ones.
++        # a draft-only export carries no trunk tensors, so it carries no PLE table
++        # to describe either
+         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+-        if not ple_layers:
++        if not ple_layers or self.mtp_only:
+             return
+         self.gguf_writer.add_ple_layers(ple_layers)
+         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81eeae..2bea45305 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -40,6 +40,12 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
+ GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
+ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
++// Multi-node NCCL world (one rank per process). unique_id is ncclUniqueId bytes.
++GGML_BACKEND_API bool ggml_backend_cuda_nccl_get_unique_id(void * out, size_t out_size);
++GGML_BACKEND_API bool ggml_backend_cuda_nccl_world_init(ggml_backend_t backend, uint64_t comm_id, int n_ranks, int rank, const void * unique_id, size_t unique_id_size);
++GGML_BACKEND_API void ggml_backend_cuda_nccl_world_free(ggml_backend_t backend, uint64_t comm_id);
++GGML_BACKEND_API bool ggml_backend_cuda_nccl_world_allreduce(ggml_backend_t backend, uint64_t comm_id, struct ggml_tensor * tensor);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
+ #ifdef  __cplusplus
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index cbfe40013..8710bebbf 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -7,7 +7,7 @@ extern "C" {
+ #endif
+ 
+ #define RPC_PROTO_MAJOR_VERSION    6
+-#define RPC_PROTO_MINOR_VERSION    0
++#define RPC_PROTO_MINOR_VERSION    4
+ #define RPC_PROTO_PATCH_VERSION    0
+ 
+ #ifdef  __cplusplus
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 3ec40fb1a..d5c891e6a 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1804,6 +1804,7 @@ struct ggml_backend_meta_context {
+ 
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
++    ggml_backend_comm_free_t             comm_free      = nullptr;
+ 
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+@@ -1824,24 +1825,35 @@ struct ggml_backend_meta_context {
+         name += ")";
+ 
+         if (n_devs > 1) {
+-            ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
+-                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
+-            if (comm_init != nullptr) {
++            ggml_backend_reg_t comm_reg = nullptr;
++            for (size_t i = 0; i < n_devs; i++) {
++                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[i]));
++                ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
++                    reg, "ggml_backend_comm_init");
++                if (comm_init == nullptr) {
++                    continue;
++                }
+                 comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
++                if (comm_ctx != nullptr) {
++                    comm_reg = reg;
++                    break;
++                }
++            }
++            if (comm_ctx != nullptr) {
++                comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
++                    ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_allreduce_tensor");
++                comm_free = (ggml_backend_comm_free_t)
++                    ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_free");
++                GGML_ASSERT(comm_allreduce != nullptr);
++                GGML_ASSERT(comm_free != nullptr);
++            } else {
++                GGML_LOG_WARN("ggml_backend_meta: no backend-specific allreduce; using butterfly fallback\n");
+             }
+-        }
+-        if (comm_ctx != nullptr) {
+-            comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
+-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+-            GGML_ASSERT(comm_allreduce != nullptr);
+         }
+     }
+ 
+     ~ggml_backend_meta_context() {
+         if (comm_ctx != nullptr) {
+-            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
+-                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
+             GGML_ASSERT(comm_free != nullptr);
+             comm_free(comm_ctx);
+         }
+@@ -2432,6 +2444,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+ 
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
++        const bool needs_allreduce = n_backends > 1 && i < backend_ctx->n_subgraphs - 1 && backend_ctx->comm_ctx != nullptr;
++        if (needs_allreduce) {
++            // mark RPC ranks so the remote allreduce runs inside the graph RPC;
++            // the coordinator then launches only local ranks below
++            for (size_t j = 0; j < n_backends; j++) {
++                auto & bcj = backend_ctx->backend_configs[j];
++                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
++                if (cgraph_ij->n_nodes > 0) {
++                    using set_post_t = void (*)(ggml_backend_t, int);
++                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(bcj.backend));
++                    auto * set_post = (set_post_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_post_compute_allreduce");
++                    if (set_post != nullptr) {
++                        set_post(bcj.backend, cgraph_ij->n_nodes - 1);
++                    }
++                }
++            }
++        }
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 7d14ce906..edd8ea888 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1458,6 +1458,17 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++#ifdef GGML_USE_NCCL
++    // one NCCL world comm per comm_id; separate ids let independent contexts
++    // (e.g. target + speculative draft models) run concurrent 2-rank collectives
++    struct world_comm_state {
++        ncclComm_t comm = nullptr;
++        int        n_ranks = 0;
++        int        rank = -1;
++    };
++    std::unordered_map<uint64_t, world_comm_state> world_comms;
++#endif
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 38bd4c9a0..b5144f6dd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -702,6 +702,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
++#ifdef GGML_USE_NCCL
++    for (auto & kv : world_comms) {
++        if (kv.second.comm != nullptr) {
++            NCCL_CHECK(ncclCommDestroy(kv.second.comm));
++        }
++    }
++    world_comms.clear();
++#endif
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -1257,6 +1266,113 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
+     return comm_ctx->try_allreduce(comm_ctx, tensors);
+ }
+ 
++#ifdef GGML_USE_NCCL
++bool ggml_backend_cuda_nccl_get_unique_id(void * out, size_t out_size) {
++    if (out == nullptr || out_size < sizeof(ncclUniqueId)) {
++        return false;
++    }
++    ncclUniqueId id;
++    ncclResult_t rc = ncclGetUniqueId(&id);
++    if (rc != ncclSuccess) {
++        GGML_LOG_ERROR("%s: ncclGetUniqueId failed: %s\n", __func__, ncclGetErrorString(rc));
++        return false;
++    }
++    memcpy(out, &id, sizeof(id));
++    if (out_size > sizeof(id)) {
++        memset((uint8_t *) out + sizeof(id), 0, out_size - sizeof(id));
++    }
++    return true;
++}
++
++bool ggml_backend_cuda_nccl_world_init(ggml_backend_t backend, uint64_t comm_id, int n_ranks, int rank, const void * unique_id, size_t unique_id_size) {
++    if (!ggml_backend_is_cuda(backend) || unique_id == nullptr || n_ranks < 2 || rank < 0 || rank >= n_ranks) {
++        return false;
++    }
++    if (unique_id_size < sizeof(ncclUniqueId)) {
++        GGML_LOG_ERROR("%s: unique_id size %zu < %zu\n", __func__, unique_id_size, sizeof(ncclUniqueId));
++        return false;
++    }
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    auto & wc = ctx->world_comms[comm_id];
++    if (wc.comm != nullptr) {
++        NCCL_CHECK(ncclCommDestroy(wc.comm));
++        wc.comm = nullptr;
++    }
++    ncclUniqueId id;
++    memcpy(&id, unique_id, sizeof(id));
++    ggml_cuda_set_device(ctx->device);
++    ncclResult_t rc = ncclCommInitRank(&wc.comm, n_ranks, id, rank);
++    if (rc != ncclSuccess) {
++        GGML_LOG_ERROR("%s: ncclCommInitRank failed: %s\n", __func__, ncclGetErrorString(rc));
++        ctx->world_comms.erase(comm_id);
++        return false;
++    }
++    wc.n_ranks = n_ranks;
++    wc.rank = rank;
++    GGML_LOG_INFO("%s: NCCL world rank %d/%d on CUDA%d (comm %" PRIu64 ")\n", __func__, rank, n_ranks, ctx->device, comm_id);
++    return true;
++}
++
++void ggml_backend_cuda_nccl_world_free(ggml_backend_t backend, uint64_t comm_id) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return;
++    }
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    auto it = ctx->world_comms.find(comm_id);
++    if (it != ctx->world_comms.end()) {
++        if (it->second.comm != nullptr) {
++            NCCL_CHECK(ncclCommDestroy(it->second.comm));
++        }
++        ctx->world_comms.erase(it);
++    }
++}
++
++bool ggml_backend_cuda_nccl_world_allreduce(ggml_backend_t backend, uint64_t comm_id, struct ggml_tensor * tensor) {
++    if (!ggml_backend_is_cuda(backend) || tensor == nullptr) {
++        return false;
++    }
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    auto it = ctx->world_comms.find(comm_id);
++    if (it == ctx->world_comms.end() || it->second.comm == nullptr) {
++        return false;
++    }
++    ncclComm_t world_comm = it->second.comm;
++    const int64_t ne = ggml_nelements(tensor);
++    if (ne == 0) {
++        return true;
++    }
++    if (!ggml_is_contiguously_allocated(tensor) || tensor->data == nullptr) {
++        return false;
++    }
++    ggml_cuda_set_device(ctx->device);
++    if (tensor->type == GGML_TYPE_F32) {
++        NCCL_CHECK(ncclAllReduce(tensor->data, tensor->data, (size_t) ne, ncclFloat, ncclSum, world_comm, ctx->stream()));
++        return true;
++    }
++    if (tensor->type == GGML_TYPE_BF16) {
++        NCCL_CHECK(ncclAllReduce(tensor->data, tensor->data, (size_t) ne, ncclBfloat16, ncclSum, world_comm, ctx->stream()));
++        return true;
++    }
++    if (tensor->type == GGML_TYPE_F16) {
++        NCCL_CHECK(ncclAllReduce(tensor->data, tensor->data, (size_t) ne, ncclHalf, ncclSum, world_comm, ctx->stream()));
++        return true;
++    }
++    GGML_LOG_ERROR("%s: unsupported type %s\n", __func__, ggml_type_name(tensor->type));
++    return false;
++}
++#else
++bool ggml_backend_cuda_nccl_get_unique_id(void *, size_t) {
++    return false;
++}
++bool ggml_backend_cuda_nccl_world_init(ggml_backend_t, uint64_t, int, int, const void *, size_t) {
++    return false;
++}
++void ggml_backend_cuda_nccl_world_free(ggml_backend_t, uint64_t) {}
++bool ggml_backend_cuda_nccl_world_allreduce(ggml_backend_t, uint64_t, struct ggml_tensor *) {
++    return false;
++}
++#endif
++
+ // host buffer type
+ 
+ static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+@@ -5687,6 +5803,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    if (strcmp(name, "ggml_backend_cuda_nccl_get_unique_id") == 0) {
++        return (void *)ggml_backend_cuda_nccl_get_unique_id;
++    }
++    if (strcmp(name, "ggml_backend_cuda_nccl_world_init") == 0) {
++        return (void *)ggml_backend_cuda_nccl_world_init;
++    }
++    if (strcmp(name, "ggml_backend_cuda_nccl_world_free") == 0) {
++        return (void *)ggml_backend_cuda_nccl_world_free;
++    }
++    if (strcmp(name, "ggml_backend_cuda_nccl_world_allreduce") == 0) {
++        return (void *)ggml_backend_cuda_nccl_world_allreduce;
++    }
+     return nullptr;
+ }
+ 
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index cc7d72069..46a58b484 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -77,6 +77,9 @@ enum rpc_cmd {
+     RPC_CMD_DEVICE_COUNT,
+     RPC_CMD_GRAPH_RECOMPUTE,
+     RPC_CMD_MEMSET_TENSOR,
++    RPC_CMD_NCCL_WORLD_INIT,
++    RPC_CMD_NCCL_WORLD_FREE,
++    RPC_CMD_NCCL_WORLD_ALLREDUCE,
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -86,6 +89,10 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+ // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
+ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+ 
++// Maximum number of graphs cached per device; client and server must use the same value
++// so that both sides clear their caches at the same point in the message stream
++const size_t GRAPH_CACHE_MAX = 1024;
++
+ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+@@ -202,6 +209,42 @@ struct rpc_msg_get_device_memory_rsp {
+ 
+ struct rpc_msg_graph_recompute_req {
+     uint32_t device;
++    uint64_t uid;
++    uint64_t comm_id;
++    uint32_t post_compute;
++    uint32_t post_node;
++};
++
++#define RPC_NCCL_UNIQUE_ID_MAX 128
++
++#define RPC_GRAPH_POST_ALLREDUCE (1u << 0)
++
++struct rpc_msg_nccl_world_init_req {
++    uint32_t device;
++    uint64_t comm_id;
++    int32_t  n_ranks;
++    int32_t  rank;
++    uint32_t unique_id_size;
++    uint8_t  unique_id[RPC_NCCL_UNIQUE_ID_MAX];
++};
++
++struct rpc_msg_nccl_world_init_rsp {
++    uint8_t ok;
++};
++
++struct rpc_msg_nccl_world_free_req {
++    uint32_t device;
++    uint64_t comm_id;
++};
++
++struct rpc_msg_nccl_world_allreduce_req {
++    uint32_t   device;
++    uint64_t   comm_id;
++    rpc_tensor tensor;
++};
++
++struct rpc_msg_nccl_world_allreduce_rsp {
++    uint8_t ok;
+ };
+ 
+ #pragma pack(pop)
+@@ -218,7 +261,8 @@ struct ggml_backend_rpc_device_context {
+     uint32_t    device;
+     std::string name;
+     std::string description;
+-    uint64_t    last_graph_uid;
++    // uids of graphs cached by the server for this device
++    std::unordered_set<uint64_t> graph_uids;
+ };
+ 
+ struct ggml_backend_rpc_buffer_type_context {
+@@ -234,6 +278,11 @@ struct ggml_backend_rpc_context {
+     std::shared_ptr<rpc_dispatcher> dispatcher;
+     uint32_t                        device;
+     std::string                     name;
++    // one-shot post-compute directive consumed by the next graph command
++    uint32_t                        pending_post_compute = 0;
++    uint32_t                        pending_post_node = 0;
++    // NCCL world comm id this backend belongs to (0 until a comm is initialized)
++    uint64_t                        comm_id = 0;
+ };
+ 
+ struct ggml_backend_rpc_buffer_context {
+@@ -700,7 +749,11 @@ static void ggml_backend_rpc_buffer_memset_tensor(
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+-    if (size > HASH_THRESHOLD) {
++    static const bool skip_hash = []() {
++        const char * env = std::getenv("GGML_RPC_SKIP_HASH");
++        return env && env[0] != '\0' && env[0] != '0';
++    }();
++    if (!skip_hash && size > HASH_THRESHOLD) {
+         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
+         request->tensor = rpc_tensor;
+         request->offset = offset;
+@@ -984,7 +1037,7 @@ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const s
+     tensors.push_back(result);
+ }
+ 
+-static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, const std::shared_ptr<rpc_dispatcher> & dispatcher, size_t * output_size) {
++static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, const std::shared_ptr<rpc_dispatcher> & dispatcher, size_t * output_size, uint32_t * post_node_out = nullptr, uint64_t comm_id = 0) {
+     uint32_t n_nodes = cgraph->n_nodes;
+     std::vector<rpc_tensor> tensors;
+     std::unordered_set<ggml_tensor*> visited;
+@@ -992,13 +1045,24 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
+         add_tensor(cgraph->nodes[i], cgraph, dispatcher, tensors, visited);
+     }
+     // serialization format:
+-    // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
++    // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) | post_compute (4 bytes) | post_node (4 bytes) | comm_id (8 bytes) |
+     uint32_t n_tensors = tensors.size();
+-    *output_size = 2*sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
++    uint32_t post_compute = 0;
++    uint32_t post_node = 0;
++    if (post_node_out != nullptr) {
++        // post_node_out holds the graph node index to allreduce after compute; UINT32_MAX disables
++        if (*post_node_out != UINT32_MAX) {
++            post_compute = RPC_GRAPH_POST_ALLREDUCE;
++            post_node = *post_node_out;
++        }
++    }
++    *output_size = 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor) + 2*sizeof(uint32_t) + sizeof(uint64_t);
+     uint8_t * output = new uint8_t[*output_size]();
+     uint8_t * dest = output;
+     memcpy(dest, &device, sizeof(device));
+     dest += sizeof(device);
++    memcpy(dest, &cgraph->uid, sizeof(cgraph->uid));
++    dest += sizeof(cgraph->uid);
+     memcpy(dest, &n_nodes, sizeof(n_nodes));
+     dest += sizeof(n_nodes);
+     for (uint32_t i = 0; i < n_nodes; i++) {
+@@ -1009,6 +1073,12 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
+     dest += sizeof(n_tensors);
+     rpc_tensor * out_tensors = (rpc_tensor *)dest;
+     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
++    dest += n_tensors * sizeof(rpc_tensor);
++    memcpy(dest, &post_compute, sizeof(post_compute));
++    dest += sizeof(post_compute);
++    memcpy(dest, &post_node, sizeof(post_node));
++    dest += sizeof(post_node);
++    memcpy(dest, &comm_id, sizeof(comm_id));
+     return output;
+ }
+ 
+@@ -1018,15 +1088,29 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
+ 
+     GGML_ASSERT(cgraph->n_nodes > 0);
+-    bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
++    uint32_t post_compute = rpc_ctx->pending_post_compute;
++    uint32_t post_node = rpc_ctx->pending_post_node;
++    rpc_ctx->pending_post_compute = 0;
++    auto & graph_uids = rpc_dev_ctx->graph_uids;
++    bool reuse = cgraph->uid != 0 && graph_uids.count(cgraph->uid) > 0;
+     if (reuse) {
+         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
+         request->device = rpc_ctx->device;
++        request->uid    = cgraph->uid;
++        request->comm_id = rpc_ctx->comm_id;
++        request->post_compute = post_compute;
++        request->post_node = post_node;
+         rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+     } else {
+-        rpc_dev_ctx->last_graph_uid = cgraph->uid;
++        if (cgraph->uid != 0) {
++            if (graph_uids.size() >= GRAPH_CACHE_MAX) {
++                graph_uids.clear();
++            }
++            graph_uids.insert(cgraph->uid);
++        }
++        uint32_t post_node_arg = post_compute ? post_node : UINT32_MAX;
+         size_t input_size = 0;
+-        uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
++        uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size, &post_node_arg, rpc_ctx->comm_id);
+         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+         rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+     }
+@@ -1115,6 +1199,231 @@ bool ggml_backend_is_rpc(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rpc_guid());
+ }
+ 
++using ggml_backend_cuda_nccl_get_unique_id_fn = bool (*)(void *, size_t);
++using ggml_backend_cuda_nccl_world_init_fn_client = bool (*)(ggml_backend_t, uint64_t, int, int, const void *, size_t);
++using ggml_backend_cuda_nccl_world_free_fn_client = void (*)(ggml_backend_t, uint64_t);
++using ggml_backend_cuda_nccl_world_allreduce_fn_client = bool (*)(ggml_backend_t, uint64_t, struct ggml_tensor *);
++
++// server-side proc lookups (same signatures as the client variants above)
++using ggml_backend_cuda_nccl_world_allreduce_fn = ggml_backend_cuda_nccl_world_allreduce_fn_client;
++
++static void * rpc_cuda_proc(ggml_backend_t backend, const char * name) {
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    if (!dev) {
++        return nullptr;
++    }
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    if (!reg) {
++        return nullptr;
++    }
++    return ggml_backend_reg_get_proc_address(reg, name);
++}
++
++void ggml_backend_rpc_set_post_compute_allreduce(ggml_backend_t backend, int node_index);
++
++struct ggml_backend_rpc_comm_context {
++    std::vector<ggml_backend_t> backends;
++    uint64_t comm_id = 0;
++    bool initialized = false;
++};
++
++static ggml_backend_reg_t rpc_find_cuda_reg() {
++    const size_t n = ggml_backend_reg_count();
++    for (size_t i = 0; i < n; i++) {
++        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
++        const char * name = ggml_backend_reg_name(reg);
++        if (name && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0)) {
++            return reg;
++        }
++    }
++    return nullptr;
++}
++
++static bool rpc_nccl_world_init_one(ggml_backend_t backend, uint64_t comm_id, int n_ranks, int rank, const void * unique_id, size_t unique_id_size) {
++    if (ggml_backend_is_rpc(backend)) {
++        ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *) backend->context;
++        auto request = std::make_shared<rpc_msg_nccl_world_init_req>();
++        memset(request.get(), 0, sizeof(*request));
++        request->device = ctx->device;
++        request->comm_id = comm_id;
++        request->n_ranks = n_ranks;
++        request->rank = rank;
++        request->unique_id_size = (uint32_t) unique_id_size;
++        memcpy(request->unique_id, unique_id, unique_id_size);
++        rpc_msg_nccl_world_init_rsp response = {};
++        ctx->dispatcher->send(RPC_CMD_NCCL_WORLD_INIT, request, sizeof(*request), &response, sizeof(response));
++        return response.ok != 0;
++    }
++    ggml_backend_reg_t cuda_reg = rpc_find_cuda_reg();
++    if (!cuda_reg) {
++        return false;
++    }
++    auto * fn = (ggml_backend_cuda_nccl_world_init_fn_client) ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_nccl_world_init");
++    if (!fn) {
++        return false;
++    }
++    return fn(backend, comm_id, n_ranks, rank, unique_id, unique_id_size);
++}
++
++static void rpc_nccl_world_free_one(ggml_backend_t backend, uint64_t comm_id) {
++    if (ggml_backend_is_rpc(backend)) {
++        ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *) backend->context;
++        auto request = std::make_shared<rpc_msg_nccl_world_free_req>();
++        request->device = ctx->device;
++        request->comm_id = comm_id;
++        ctx->dispatcher->send(RPC_CMD_NCCL_WORLD_FREE, request, sizeof(*request));
++        return;
++    }
++    ggml_backend_reg_t cuda_reg = rpc_find_cuda_reg();
++    if (!cuda_reg) {
++        return;
++    }
++    auto * fn = (ggml_backend_cuda_nccl_world_free_fn_client) ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_nccl_world_free");
++    if (fn) {
++        fn(backend, comm_id);
++    }
++}
++
++static bool rpc_nccl_world_allreduce_one(ggml_backend_t backend, uint64_t comm_id, struct ggml_tensor * tensor) {
++    if (ggml_backend_is_rpc(backend)) {
++        ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *) backend->context;
++        auto request = std::make_shared<rpc_msg_nccl_world_allreduce_req>();
++        request->device = ctx->device;
++        request->comm_id = comm_id;
++        request->tensor = serialize_tensor(tensor, ctx->dispatcher);
++        rpc_msg_nccl_world_allreduce_rsp response = {};
++        ctx->dispatcher->send(RPC_CMD_NCCL_WORLD_ALLREDUCE, request, sizeof(*request), &response, sizeof(response));
++        return response.ok != 0;
++    }
++    ggml_backend_reg_t cuda_reg = rpc_find_cuda_reg();
++    if (!cuda_reg) {
++        return false;
++    }
++    auto * fn = (ggml_backend_cuda_nccl_world_allreduce_fn_client) ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_nccl_world_allreduce");
++    if (!fn) {
++        return false;
++    }
++    return fn(backend, comm_id, tensor);
++}
++
++static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
++    if (backends == nullptr || n_backends < 2) {
++        return nullptr;
++    }
++    ggml_backend_reg_t cuda_reg = rpc_find_cuda_reg();
++    if (!cuda_reg) {
++        return nullptr;
++    }
++    auto * get_id = (ggml_backend_cuda_nccl_get_unique_id_fn) ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_nccl_get_unique_id");
++    if (!get_id) {
++        GGML_LOG_WARN("%s: CUDA NCCL unique id not available\n", __func__);
++        return nullptr;
++    }
++    uint8_t unique_id[RPC_NCCL_UNIQUE_ID_MAX] = {};
++    if (!get_id(unique_id, sizeof(unique_id))) {
++        GGML_LOG_ERROR("%s: ncclGetUniqueId failed\n", __func__);
++        return nullptr;
++    }
++    // comm id: derived from the unique id so all ranks agree without extra state
++    uint64_t comm_id;
++    memcpy(&comm_id, unique_id, sizeof(comm_id));
++
++    auto * ctx = new ggml_backend_rpc_comm_context;
++    ctx->backends.assign(backends, backends + n_backends);
++    ctx->comm_id = comm_id;
++    // stamp the comm id on RPC backends so their graph commands can select the right comm
++    for (size_t i = 0; i < n_backends; i++) {
++        if (ggml_backend_is_rpc(backends[i])) {
++            ((ggml_backend_rpc_context *) backends[i]->context)->comm_id = comm_id;
++        }
++    }
++    const int n_ranks = (int) n_backends;
++    std::vector<std::future<bool>> inits;
++    inits.reserve(n_backends);
++    for (size_t i = 0; i < n_backends; i++) {
++        ggml_backend_t backend = backends[i];
++        inits.push_back(std::async(std::launch::async, [=]() {
++            return rpc_nccl_world_init_one(backend, comm_id, n_ranks, (int) i, unique_id, RPC_NCCL_UNIQUE_ID_MAX);
++        }));
++    }
++    bool all_ok = true;
++    for (size_t i = 0; i < inits.size(); i++) {
++        if (!inits[i].get()) {
++            GGML_LOG_ERROR("%s: NCCL world init failed for rank %zu\n", __func__, i);
++            all_ok = false;
++        }
++    }
++    if (!all_ok) {
++        for (size_t j = 0; j < n_backends; j++) {
++            rpc_nccl_world_free_one(backends[j], comm_id);
++        }
++        delete ctx;
++        return nullptr;
++    }
++    ctx->initialized = true;
++    GGML_LOG_INFO("%s: NCCL world of %d ranks over mixed CUDA/RPC backends (comm %" PRIu64 ")\n", __func__, n_ranks, comm_id);
++    return ctx;
++}
++
++static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
++    if (comm_ctx_v == nullptr) {
++        return;
++    }
++    auto * ctx = static_cast<ggml_backend_rpc_comm_context *>(comm_ctx_v);
++    if (ctx->initialized) {
++        for (ggml_backend_t backend : ctx->backends) {
++            rpc_nccl_world_free_one(backend, ctx->comm_id);
++        }
++    }
++    delete ctx;
++}
++
++void ggml_backend_rpc_set_post_compute_allreduce(ggml_backend_t backend, int node_index) {
++    if (!ggml_backend_is_rpc(backend) || backend->context == nullptr || node_index < 0) {
++        return;
++    }
++    ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *) backend->context;
++    ctx->pending_post_compute = RPC_GRAPH_POST_ALLREDUCE;
++    ctx->pending_post_node = (uint32_t) node_index;
++}
++
++static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
++    if (comm_ctx_v == nullptr || tensors == nullptr) {
++        return false;
++    }
++    auto * ctx = static_cast<ggml_backend_rpc_comm_context *>(comm_ctx_v);
++    if (!ctx->initialized) {
++        return false;
++    }
++    const size_t n = ctx->backends.size();
++    for (size_t i = 0; i < n; i++) {
++        if (tensors[i] == nullptr) {
++            return false;
++        }
++    }
++    // remote ranks already joined the collective inside their graph RPC;
++    // only launch local CUDA ranks here
++    std::vector<std::future<bool>> futs;
++    futs.reserve(n);
++    for (size_t i = 0; i < n; i++) {
++        ggml_backend_t backend = ctx->backends[i];
++        if (ggml_backend_is_rpc(backend)) {
++            continue;
++        }
++        ggml_tensor * tensor = tensors[i];
++        futs.push_back(std::async(std::launch::async, [=]() {
++            return rpc_nccl_world_allreduce_one(backend, ctx->comm_id, tensor);
++        }));
++    }
++    bool ok = true;
++    for (auto & fut : futs) {
++        if (!fut.get()) {
++            ok = false;
++        }
++    }
++    return ok;
++}
++
+ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
+     auto dispatcher = get_dispatcher(endpoint);
+     auto request = std::make_shared<rpc_msg_get_device_memory_req>();
+@@ -1152,6 +1461,9 @@ public:
+     bool init_tensor(const rpc_msg_init_tensor_req & request);
+     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
++    bool nccl_world_init(const rpc_msg_nccl_world_init_req & request, rpc_msg_nccl_world_init_rsp & response);
++    bool nccl_world_free(const rpc_msg_nccl_world_free_req & request);
++    bool nccl_world_allreduce(const rpc_msg_nccl_world_allreduce_req & request, rpc_msg_nccl_world_allreduce_rsp & response);
+ 
+     struct stored_graph {
+         std::vector<uint8_t>   buffer;
+@@ -1165,13 +1477,19 @@ private:
+                               struct ggml_context * ctx,
+                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
+                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
++    bool graph_post_compute_allreduce(uint32_t device, ggml_cgraph * graph, uint32_t node_idx, uint64_t comm_id);
+ 
+ 
+     std::vector<ggml_backend_t> backends;
+     const char * cache_dir;
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+-    // store the last computed graph for each backend
+-    std::vector<stored_graph> stored_graphs;
++    // computed graphs cached per backend, keyed by uid
++    std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
++
++    // per-connection graph statistics, logged once when the connection closes
++    uint64_t stat_graph_compute    = 0;
++    uint64_t stat_graph_recompute  = 0;
++    uint64_t stat_post_allreduce   = 0;
+ };
+ 
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+@@ -1383,7 +1701,20 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
+         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
+         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
+         GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
+-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
++        // Tensor-split graphs can serialize views whose logical nbytes() is the
++        // unsplit tensor. Bound by the remaining buffer bytes instead.
++        const uint64_t remaining = (tensor->data >= buffer_start) ? (buffer_start + buffer_size - tensor->data) : 0;
++        if (!(tensor->data >= buffer_start && remaining >= 1)) {
++            GGML_LOG_ERROR("[%s] tensor data 0x%" PRIx64 " outside buffer [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
++                           __func__, tensor->data, buffer_start, buffer_start + buffer_size);
++            result->buffer = nullptr;
++            result->data = nullptr;
++            return result;
++        }
++        if (tensor_size > remaining) {
++            LOG_DBG("[%s] clipped tensor_size %" PRIu64 " -> remaining %" PRIu64 " for %s\n",
++                    __func__, tensor_size, remaining, tensor->name);
++        }
+     }
+ 
+     result->op = (ggml_op) tensor->op;
+@@ -1680,21 +2011,25 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+ 
+ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     // serialization format:
+-    // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+-    if (input.size() < 2*sizeof(uint32_t)) {
++    // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) | post_compute (4 bytes) | post_node (4 bytes) |
++    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
+         return false;
+     }
+     const uint8_t * src = input.data();
++    const uint8_t * end = input.data() + input.size();
+     uint32_t device;
+     memcpy(&device, src, sizeof(device));
+     src += sizeof(device);
+     if (device >= backends.size()) {
+         return false;
+     }
++    uint64_t uid;
++    memcpy(&uid, src, sizeof(uid));
++    src += sizeof(uid);
+     uint32_t n_nodes;
+     memcpy(&n_nodes, src, sizeof(n_nodes));
+     src += sizeof(n_nodes);
+-    if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
++    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+         return false;
+     }
+     const uint64_t * nodes = (const uint64_t *)src;
+@@ -1702,19 +2037,40 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     uint32_t n_tensors;
+     memcpy(&n_tensors, src, sizeof(n_tensors));
+     src += sizeof(n_tensors);
+-    if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
++    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
+         return false;
+     }
+     const rpc_tensor * tensors = (const rpc_tensor *)src;
+-    LOG_DBG("[%s] device: %u, n_nodes: %u, n_tensors: %u\n", __func__, device, n_nodes, n_tensors);
++    src += n_tensors*sizeof(rpc_tensor);
++    uint32_t post_compute = 0;
++    uint32_t post_node = 0;
++    uint64_t comm_id = 0;
++    if (src + 2*sizeof(uint32_t) <= end) {
++        memcpy(&post_compute, src, sizeof(post_compute));
++        src += sizeof(post_compute);
++        memcpy(&post_node, src, sizeof(post_node));
++        src += sizeof(post_node);
++    }
++    if (src + sizeof(uint64_t) <= end) {
++        memcpy(&comm_id, src, sizeof(comm_id));
++    }
++    LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u, post_compute: %u, comm_id: %" PRIu64 "\n", __func__, device, uid, n_nodes, n_tensors, post_compute, comm_id);
++    stat_graph_compute++;
++
++    // graphs with uid == 0 are not cached, see GRAPH_CACHE_MAX for the eviction policy
++    if (uid != 0 && stored_graphs[device].size() >= GRAPH_CACHE_MAX) {
++        stored_graphs[device].clear();
++    }
++    stored_graph sg_tmp;
++    stored_graph & sg = uid != 0 ? stored_graphs[device][uid] : sg_tmp;
+ 
+     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
+-    if (stored_graphs[device].buffer.size() < buf_size) {
+-        stored_graphs[device].buffer.resize(buf_size);
++    if (sg.buffer.size() < buf_size) {
++        sg.buffer.resize(buf_size);
+     }
+     struct ggml_init_params params = {
+         /*.mem_size   =*/ buf_size,
+-        /*.mem_buffer =*/ stored_graphs[device].buffer.data(),
++        /*.mem_buffer =*/ sg.buffer.data(),
+         /*.no_alloc   =*/ true,
+     };
+     ggml_context_ptr ctx_ptr { ggml_init(params) };
+@@ -1748,22 +2104,59 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     }
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+-    stored_graphs[device].graph = graph;
++    sg.graph = graph;
++    if (post_compute & RPC_GRAPH_POST_ALLREDUCE) {
++        if (!graph_post_compute_allreduce(device, graph, post_node, comm_id)) {
++            GGML_LOG_ERROR("[%s] post-compute allreduce failed\n", __func__);
++            return false;
++        }
++    }
+     return true;
+ }
+ 
++bool rpc_server::graph_post_compute_allreduce(uint32_t device, ggml_cgraph * graph, uint32_t node_idx, uint64_t comm_id) {
++    if (device >= backends.size() || graph == nullptr) {
++        return false;
++    }
++    if (node_idx >= (uint32_t) graph->n_nodes) {
++        GGML_LOG_ERROR("[%s] node %u out of range (n_nodes=%d)\n", __func__, node_idx, graph->n_nodes);
++        return false;
++    }
++    ggml_tensor * tensor = graph->nodes[node_idx];
++    if (tensor == nullptr || tensor->data == nullptr) {
++        GGML_LOG_ERROR("[%s] post-compute node %u has no data\n", __func__, node_idx);
++        return false;
++    }
++    stat_post_allreduce++;
++    auto * fn = (ggml_backend_cuda_nccl_world_allreduce_fn) rpc_cuda_proc(backends[device], "ggml_backend_cuda_nccl_world_allreduce");
++    if (!fn) {
++        GGML_LOG_ERROR("[%s] NCCL world allreduce not available on device %u\n", __func__, device);
++        return false;
++    }
++    return fn(backends[device], comm_id, tensor);
++}
++
+ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     uint32_t device = request.device;
+     if (device >= backends.size()) {
+         return false;
+     }
+-    if (stored_graphs[device].graph == nullptr) {
++    auto it = stored_graphs[device].find(request.uid);
++    if (it == stored_graphs[device].end() || it->second.graph == nullptr) {
++        GGML_LOG_ERROR("[%s] device: %u, graph with uid %" PRIu64 " not found\n", __func__, device, request.uid);
+         return false;
+     }
+-    ggml_cgraph * graph = stored_graphs[device].graph;
+-    LOG_DBG("[%s] device: %u\n", __func__, device);
++    ggml_cgraph * graph = it->second.graph;
++    LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", post_compute: %u, comm_id: %" PRIu64 "\n", __func__, device, request.uid, request.post_compute, request.comm_id);
++    stat_graph_recompute++;
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    if (request.post_compute & RPC_GRAPH_POST_ALLREDUCE) {
++        if (!graph_post_compute_allreduce(device, graph, request.post_node, request.comm_id)) {
++            GGML_LOG_ERROR("[%s] post-compute allreduce failed\n", __func__);
++            return false;
++        }
++    }
+     return true;
+ }
+ 
+@@ -1781,10 +2174,70 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
+     return true;
+ }
+ 
++using ggml_backend_cuda_nccl_world_init_fn = bool (*)(ggml_backend_t, uint64_t, int, int, const void *, size_t);
++using ggml_backend_cuda_nccl_world_free_fn = void (*)(ggml_backend_t, uint64_t);
++
++bool rpc_server::nccl_world_init(const rpc_msg_nccl_world_init_req & request, rpc_msg_nccl_world_init_rsp & response) {
++    response.ok = 0;
++    if (request.device >= backends.size()) {
++        return false;
++    }
++    if (request.unique_id_size == 0 || request.unique_id_size > RPC_NCCL_UNIQUE_ID_MAX) {
++        return false;
++    }
++    auto * fn = (ggml_backend_cuda_nccl_world_init_fn) rpc_cuda_proc(backends[request.device], "ggml_backend_cuda_nccl_world_init");
++    if (!fn) {
++        GGML_LOG_ERROR("[%s] CUDA NCCL world init not available on device %u\n", __func__, request.device);
++        return true;
++    }
++    response.ok = fn(backends[request.device], request.comm_id, request.n_ranks, request.rank, request.unique_id, request.unique_id_size) ? 1 : 0;
++    return true;
++}
++
++bool rpc_server::nccl_world_free(const rpc_msg_nccl_world_free_req & request) {
++    if (request.device >= backends.size()) {
++        return false;
++    }
++    auto * fn = (ggml_backend_cuda_nccl_world_free_fn) rpc_cuda_proc(backends[request.device], "ggml_backend_cuda_nccl_world_free");
++    if (fn) {
++        fn(backends[request.device], request.comm_id);
++    }
++    return true;
++}
++
++bool rpc_server::nccl_world_allreduce(const rpc_msg_nccl_world_allreduce_req & request, rpc_msg_nccl_world_allreduce_rsp & response) {
++    response.ok = 0;
++    if (request.device >= backends.size()) {
++        return false;
++    }
++    struct ggml_init_params params {
++        /*.mem_size   =*/ ggml_tensor_overhead(),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx_ptr { ggml_init(params) };
++    GGML_ASSERT(ctx_ptr != nullptr);
++    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
++    if (tensor == nullptr || tensor->data == nullptr) {
++        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
++        return false;
++    }
++    auto * fn = (ggml_backend_cuda_nccl_world_allreduce_fn) rpc_cuda_proc(backends[request.device], "ggml_backend_cuda_nccl_world_allreduce");
++    if (!fn) {
++        return true;
++    }
++    response.ok = fn(backends[request.device], request.comm_id, tensor) ? 1 : 0;
++    return true;
++}
++
+ rpc_server::~rpc_server() {
+     for (auto buffer : buffers) {
+         ggml_backend_buffer_free(buffer);
+     }
++    if (stat_graph_compute + stat_graph_recompute > 0) {
++        GGML_LOG_INFO("[%s] connection stats: graph_compute: %" PRIu64 ", graph_recompute: %" PRIu64
++                      ", post_allreduce: %" PRIu64 "\n", __func__, stat_graph_compute, stat_graph_recompute, stat_post_allreduce);
++    }
+ }
+ 
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+@@ -2047,6 +2500,44 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 }
+                 break;
+             }
++            case RPC_CMD_NCCL_WORLD_INIT: {
++                rpc_msg_nccl_world_init_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                rpc_msg_nccl_world_init_rsp response;
++                if (!server.nccl_world_init(request, response)) {
++                    return;
++                }
++                if (!send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_NCCL_WORLD_FREE: {
++                rpc_msg_nccl_world_free_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                if (!server.nccl_world_free(request)) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_NCCL_WORLD_ALLREDUCE: {
++                rpc_msg_nccl_world_allreduce_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                rpc_msg_nccl_world_allreduce_rsp response;
++                if (!server.nccl_world_allreduce(request, response)) {
++                    return;
++                }
++                if (!send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
+             default: {
+                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+                 return;
+@@ -2269,6 +2760,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
+         return (void *)ggml_backend_rpc_start_server;
+     }
++    if (std::strcmp(name, "ggml_backend_rpc_set_post_compute_allreduce") == 0) {
++        return (void *)ggml_backend_rpc_set_post_compute_allreduce;
++    }
++    if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
++        return (void *)ggml_backend_rpc_comm_init;
++    }
++    if (std::strcmp(name, "ggml_backend_comm_free") == 0) {
++        return (void *)ggml_backend_rpc_comm_free;
++    }
++    if (std::strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
++        return (void *)ggml_backend_rpc_comm_allreduce_tensor;
++    }
+     return NULL;
+ 
+     GGML_UNUSED(reg);
+@@ -2327,7 +2830,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
+             /* .device      = */    ind,
+             /* .name        = */    dev_name,
+             /* .description = */    dev_desc,
+-            /* .last_graph_uid = */ 0,
++            /* .graph_uids  = */    {},
+         };
+ 
+         ggml_backend_dev_t dev = new ggml_backend_device {
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index d2dfeece5..eed2ffd60 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -2803,6 +2803,16 @@ class TensorNameMap:
+             MODEL_TENSOR.HC_HEAD_UP: (
+                 "model.hyper_connection_mixer.input_mix_weight_up",
+             ),
++            # the MTP head carries its own copy of the head mixer above
++            MODEL_TENSOR.NEXTN_HC_HEAD_NORM: (
++                "model.layers.{bid}.hyper_connection_mixer.hc_norm",
++            ),
++            MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: (
++                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_down",
++            ),
++            MODEL_TENSOR.NEXTN_HC_HEAD_UP: (
++                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_up",
++            ),
+             MODEL_TENSOR.INDEXER_Q_NORM: (
+                 "model.layers.{bid}.self_attn.indexer.q_layernorm",
+             ),
+diff --git a/include/llama.h b/include/llama.h
+index ef7a012c4..8249c9938 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -347,6 +347,8 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++        bool output_replicated; // replicate the output projection (lm_head) in full on every device
++                               // (tensor parallelism); required by drafters that rank the vocabulary in-graph
+     };
+ 
+     struct llama_sampler_seq_config {
+diff --git a/scripts/build_spark.sh b/scripts/build_spark.sh
+new file mode 100755
+index 000000000..25bd1f6e0
+--- /dev/null
++++ b/scripts/build_spark.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$ROOT"
++export PATH="/usr/local/cuda/bin:${PATH}"
++export NCCL_ROOT=/usr
++cmake -B build -DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_NCCL=ON \
++    -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
++    -DCMAKE_CUDA_ARCHITECTURES=121 \
++    -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
++cmake --build build --config Release -j"$(nproc)" --target llama-cli ggml-rpc-server
++echo BUILD_OK
+diff --git a/scripts/run_qwen38_tp2.sh b/scripts/run_qwen38_tp2.sh
+new file mode 100755
+index 000000000..1c661bd2d
+--- /dev/null
++++ b/scripts/run_qwen38_tp2.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++# Two-node tensor-parallel PoC: local CUDA + remote RPC, NCCL over RoCE.
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++BIN="${ROOT}/build/bin"
++GGUF="${QWEN_GGUF:-/home/maci/qwen3.8-flash-next/models/unsloth/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}"
++REMOTE="${REMOTE_RPC:-10.0.1.2:50052}"
++PROMPT="${PROMPT:-What is 2+2? Answer with just the number.}"
++
++export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}"
++export NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f1}"
++export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
++
++exec "${BIN}/llama-cli" \
++    -m "${GGUF}" \
++    --rpc "${REMOTE}" \
++    --split-mode tensor \
++    -ngl 999 \
++    -fa on \
++    -ctk f16 -ctv f16 \
++    --ctx-size "${CTX:-2048}" \
++    -n "${N_PREDICT:-32}" \
++    --no-warmup \
++    -p "${PROMPT}" \
++    "$@"
+diff --git a/scripts/start_rpc_spark.sh b/scripts/start_rpc_spark.sh
+new file mode 100755
+index 000000000..321cc4b1f
+--- /dev/null
++++ b/scripts/start_rpc_spark.sh
+@@ -0,0 +1,7 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}"
++export NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f1}"
++export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
++exec "${ROOT}/build/bin/ggml-rpc-server" -H 0.0.0.0 -p 50052 -c
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index b5efb7206..464417502 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -578,6 +578,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
+     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
+     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_NORM,                     "blk.%d.nextn.hc_head_norm" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_DOWN,                     "blk.%d.nextn.hc_head_down" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_UP,                       "blk.%d.nextn.hc_head_up" },
+     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
+     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
+     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
+@@ -967,6 +970,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_NORM,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_DOWN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_UP,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     // Nemotron 3 Super
+     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
+     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+@@ -1150,7 +1156,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+         case LLM_ARCH_BAILINGMOE3:
+         case LLM_ARCH_KIMI_K3:
+         case LLM_ARCH_QWEN3TTS:
+-        case LLM_ARCH_QWEN4EXP:   // TODO: fix test-llama-archs
+             return false;
+         default:
+             return true;
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index f1d173a57..01e2bbe1d 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -690,6 +690,11 @@ enum llm_tensor {
+     LLM_TENSOR_NEXTN_HNORM,
+     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
+     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
++    // qwen4exp: the MTP head ends in its own hyper-connection mixer rather than a
++    // plain RMSNorm, mirroring the trunk's hc_head_* (which is its output norm)
++    LLM_TENSOR_NEXTN_HC_HEAD_NORM,
++    LLM_TENSOR_NEXTN_HC_HEAD_DOWN,
++    LLM_TENSOR_NEXTN_HC_HEAD_UP,
+     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
+     LLM_TENSOR_MASKED_EMBD_ORDERING,
+     LLM_TENSOR_FC,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0adc07449..6782516c0 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -579,7 +579,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+ 
+         // output
+         if (std::regex_match(tensor_name, pattern_output_weight)) {
+-            if (is_dsv4) {
++            if (is_dsv4 || ud->model->output_replicated) {
+                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+             }
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+@@ -587,6 +587,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+         if (std::regex_match(tensor_name, pattern_output_bias)) {
+             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
+             GGML_ASSERT(output_weight != nullptr);
++            // bias must follow the lm_head: when the weight is replicated the bias is too,
++            // otherwise the ADD of (MIRRORED logits + axis-0 bias) is invalid in the meta backend
++            if (is_dsv4 || ud->model->output_replicated) {
++                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            }
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+         }
+ 
+@@ -1185,6 +1190,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
+         this->params.tensor_split = pimpl->tensor_split_owned.data();
+     }
+     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
++
++    output_replicated = params.output_replicated;
+ }
+ 
+ llama_model::~llama_model() {
+@@ -2509,7 +2516,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                 const bool mtp_on_hybrid_qwen =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+-                     arch == LLM_ARCH_BAILINGMOE3);
++                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
+ 
+                 const bool mtp_on_hybrid_nemotron =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
+@@ -2773,6 +2780,7 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.output_replicated           =*/ false,
+     };
+ 
+     return result;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 4c4a30e01..438c69602 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -228,6 +228,12 @@ struct llama_layer_nextn {
+     struct ggml_tensor * shared_head_head_s    = nullptr;
+     struct ggml_tensor * shared_head_head_in_s = nullptr;
+     struct ggml_tensor * shared_head_norm      = nullptr;
++
++    // qwen4exp: the MTP head's own final hyper-connection mixer, which stands in for both
++    // the stream collapse and the output norm (the trunk has no separate output_norm either)
++    struct ggml_tensor * hc_head_norm          = nullptr;
++    struct ggml_tensor * hc_head_down          = nullptr;
++    struct ggml_tensor * hc_head_up            = nullptr;
+ };
+ 
+ struct llama_layer_switch_lora {
+@@ -709,6 +715,10 @@ struct llama_model {
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+ 
++    // when set, the output projection (lm_head) is replicated in full on every device.
++    // required by DFlash2/DSpark drafters that rank the vocabulary inside the graph.
++    bool output_replicated = false;
++
+     int64_t t_load_us  = 0;
+     int64_t t_start_us = 0;
+ 
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index da84f30b6..3a58a8d4b 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -148,6 +148,14 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+                 hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
+     }
+ 
++    // DFlash2/DSpark rank the full draft vocabulary in-graph (top_k/argmax on the lm_head
++    // output), which requires the lm_head to be replicated on every device. The target-side
++    // flag is set in common_init before load (see common_speculative_draft_ranks_full_output);
++    // set it here too so direct library users of the draft model get the same layout.
++    if (selector_meta || markov_meta) {
++        output_replicated = true;
++    }
++
+     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
+     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
+diff --git a/src/models/models.h b/src/models/models.h
+index 87195fddd..0c503d851 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2355,7 +2355,11 @@ struct llama_model_qwen4exp : public llama_model_base {
+ 
+     struct graph : public llm_build_delta_net_base {
+         graph(const llama_model & model, const llm_graph_params & params);
+-    private:
++    protected:
++        // tag-dispatched ctor for graph_mtp: binds the members without building the trunk
++        struct no_build_t {};
++        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
++            llm_build_delta_net_base(params), model(model) {}
+         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
+         ggml_tensor * build_hc_mix(
+                     ggml_tensor * x,
+@@ -2447,6 +2451,11 @@ struct llama_model_qwen4exp : public llama_model_base {
+         const llama_model & model;
+     };
+ 
++    // LLM_GRAPH_TYPE_DECODER_MTP draft head: one HC-wrapped dense-attention + MoE block
++    struct graph_mtp : public graph {
++        graph_mtp(const llama_model & model, const llm_graph_params & params);
++    };
++
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 8ace95f73..02b8f19ef 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -24,6 +24,11 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
+ }
+ 
+ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
++    // NextN/MTP: an extra decoder block appended past the trunk. Read this first, since
++    // n_layer() == n_layer_all - n_layer_nextn feeds every per-layer array below.
++    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
++    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
++
+     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+@@ -188,7 +193,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+     }
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    // MTP tensors sit in the trailing blocks; skip them entirely unless a draft head was asked for
++    const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
++    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
++    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
++
++    auto load_block_trunk = [&](int il, int flags) {
+         auto & layer = layers[il];
+ 
+         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
+@@ -203,61 +213,97 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+         const int64_t conv_dim   = key_dim * 2 + value_dim;
+ 
+         // two HC modules per layer: before the token mixer, before the MoE
+-        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, 0);
+-        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, 0);
+-        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, 0);
+-        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, 0);
+-        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, 0);
+-        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, 0);
+-        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, 0);
+-        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, 0);
++        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, flags);
++        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, flags);
++        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
++        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, flags);
++        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, flags);
++        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, flags);
++        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
++        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, flags);
+ 
+         if (!hparams.is_recr(il)) {
+             // full attention: wq holds [q|gate] interleaved per head
+-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
+-            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, 0);
++            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
++            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
+ 
+-            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, 0);
+-            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, 0);
++            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
++            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+ 
+             const int64_t idx_dim = hparams.indexer_head_size;
+-            layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, 0);
+-            layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il), { n_embd, idx_dim }, 0);
+-            layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, 0);
+-            layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, 0);
++            layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, flags);
++            layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il), { n_embd, idx_dim }, flags);
++            layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, flags);
++            layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, flags);
+         } else {
+-            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { n_embd, key_dim * 2 + value_dim }, 0);
+-            layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { n_embd, value_dim }, 0);
+-            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, 0);
+-            layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, 0);
+-            layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, 0);
+-            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, 0);
+-            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, 0);
+-            layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, 0);
+-            layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, n_embd }, 0);
++            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { n_embd, key_dim * 2 + value_dim }, flags);
++            layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { n_embd, value_dim }, flags);
++            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
++            layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, flags);
++            layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, flags);
++            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, flags);
++            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, flags);
++            layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, flags);
++            layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, n_embd }, flags);
+         }
+ 
+         if (hparams.is_ple(il)) {
+-            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, 0);
+-            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, 0);
+-            layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, 0);
+-            layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, 0);
+-            layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, 0);
+-            layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, 0);
++            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, flags);
++            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, flags);
++            layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, flags);
++            layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, flags);
++            layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, flags);
++            layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
+         }
+ 
+-        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
+-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
++        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
++        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
++        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
++
++        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
++        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
++        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
++        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
++    };
++
++    auto load_block_mtp = [&](int il) {
++        // the MTP block is structurally a trunk block: is_recr()/is_ple() are both false past
++        // the trunk, so reuse the trunk loader, then add the NextN-specific tensors
++        load_block_trunk(il, mtp_flags);
+ 
+-        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
+-        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
+-        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
+-        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
++        auto & layer = layers[il];
++
++        // NextN/MTP head. enorm/hnorm gate the two inputs; eh_proj is the checkpoint's
++        // fc_embedding and fc_hidden fused side by side, so one matmul over
++        // concat(e, h) computes fc_embedding@e + fc_hidden@h.
++        layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, mtp_flags);
++        layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, mtp_flags);
++        layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
++
++        // the head's own output mixer, mirroring the trunk's hc_head_*: it collapses the
++        // hc streams and stands in for the output norm, of which qwen4exp has none
++        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, mtp_flags);
++        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mtp_flags);
++        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mtp_flags);
++
++        // qwen4exp sets mtp_use_dedicated_embeddings=false, so these are absent and the
++        // head falls back to the trunk's embedding table and LM head
++        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, mtp_flags | TENSOR_NOT_REQUIRED);
++        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, mtp_flags | TENSOR_NOT_REQUIRED);
++    };
++
++    for (int i = 0; i < n_layer; i++) {
++        load_block_trunk(i, trunk_flags);
++    }
++    for (int i = n_layer; i < n_layer_all; i++) {
++        load_block_mtp(i);
+     }
+ }
+ 
+ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
++    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
++        return std::make_unique<graph_mtp>(*this, params);
++    }
+     return std::make_unique<graph>(*this, params);
+ }
+ 
+@@ -373,6 +419,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+             n_embd, hc, n_tokens, 1);
+     cb(res_hc, "hc_init", -1);
++    // make sure hc_init is in the same graph split as the first layer (-sm tensor)
++    ggml_build_forward_expand(gf, res_hc);
+ 
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = res_hc;
+@@ -397,7 +445,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+         }
+ 
+-        if (il == n_layer - 1 && inp_out_ids) {
++        // an unmasked MTP export needs a hidden row for every token, so in that case the
++        // gather is deferred until after t_h_nextn is taken below
++        const bool gather_now = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
++
++        if (il == n_layer - 1 && inp_out_ids && gather_now) {
+             // everything below is per token, so drop the rows that produce no output
+             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+@@ -425,6 +477,23 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+         cb(res_hc, "l_last", il);
+     }
+ 
++    // The MTP head consumes the wide residual, before the head mixer collapses it. Export the
++    // combine result itself rather than a reshape of it: a pure view gets no backend assignment
++    // from the scheduler, and the readback in llama_context looks one up. It is contiguous, so
++    // [n_embd, hc, rows] already has the [n_embd_out, rows] layout the reader expects, and it
++    // carries exactly the right rows either way -- gathered above when masked, ungathered when not.
++    if (cparams.embeddings_nextn) {
++        cb(res_hc, "h_nextn", -1);
++        res->t_h_nextn = res_hc;
++
++        // deferred from the last layer: collapse to the output rows now that the export is taken
++        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
++            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
++            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
++            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
++        }
++    }
++
+     // the final mixer is the output norm: there is no separate one
+     ggml_tensor * cur = build_hc_mix(res_hc,
+             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
+@@ -440,6 +509,197 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+     ggml_build_forward_expand(gf, cur);
+ }
+ 
++// LLM_GRAPH_TYPE_DECODER_MTP draft head for qwen4exp.
++//
++// The head folds the next token's embedding into the trunk's wide hyper-connection residual,
++// runs one trunk-style block over it, and collapses the result with its own mixer before
++// reusing the trunk's LM head. The wide post-block residual is exported as t_h_nextn so the
++// speculative driver can feed it straight back in for the next draft step.
++//
++// v1 simplification: the block attends densely. The trunk's QSA only prunes context past a
++// 2048-token budget, so dense is a numerical superset; drafts are verified by the target
++// either way. The indexer tensors are still loaded so the GGUF stays complete.
++// TODO: wire up QSA here for long-context draft fidelity.
++llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
++    graph(model, params, no_build_t{}) {
++    GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
++    GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
++    GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
++
++    const int64_t hc     = hparams.dsv4_hc_mult;
++    const int64_t hc_dim = hc * n_embd;
++    GGML_ASSERT(hparams.n_embd_out() == (uint32_t) hc_dim && "QWEN4EXP MTP hidden width mismatch");
++
++    const int il = hparams.n_layer();
++    const auto & layer = model.layers[il];
++
++    GGML_ASSERT(layer.nextn.eh_proj      && "MTP block missing nextn.eh_proj");
++    GGML_ASSERT(layer.nextn.enorm        && "MTP block missing nextn.enorm");
++    GGML_ASSERT(layer.nextn.hnorm        && "MTP block missing nextn.hnorm");
++    GGML_ASSERT(layer.nextn.hc_head_norm && "MTP block missing nextn.hc_head_norm");
++
++    int sections[4];
++    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
++
++    auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
++
++    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++    ggml_set_input(inp->tokens);
++
++    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
++    ggml_set_input(inp->embd);
++
++    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
++    ggml_set_input(inp->h);
++    ggml_set_name(inp->h, "mtp_h_input");
++
++    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
++    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
++    cb(tok_embd, "mtp_tok_embd", il);
++
++    ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
++    cb(h_state, "mtp_h_state", il);
++
++    res->add_input(std::move(inp));
++
++    ggml_tensor * inp_pos     = build_inp_pos();
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    auto * inp_attn = build_attn_inp_kv();
++
++    // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
++    // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
++    ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
++    h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
++    h_norm = ggml_mul(ctx0, h_norm, layer.nextn.hnorm);
++    h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
++    cb(h_norm, "mtp_hnorm", il);
++
++    // the token embedding is shared across the streams, so broadcast it to hc copies
++    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
++    e_norm = ggml_repeat_4d(ctx0,
++            ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens),
++            n_embd, hc, n_tokens, 1);
++    cb(e_norm, "mtp_enorm", il);
++
++    // eh_proj holds fc_embedding and fc_hidden side by side, so this one matmul is
++    // fc_embedding @ e_norm + fc_hidden @ h_norm, applied to each stream independently.
++    // Keeping the streams distinct here is the point of the hyper-connection residual:
++    // pooling them before the projection would throw that away.
++    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
++    cb(concat, "mtp_concat", il);
++
++    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
++    cb(res_hc, "mtp_eh_proj", il);
++
++    ggml_tensor * inject = nullptr;
++    ggml_tensor * cur = build_hc_mix(res_hc,
++            layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
++            &inject, il);
++    cb(cur, "mtp_hc_attn_pre", il);
++
++    // ---- dense attention, mirroring the trunk's full-attention branch ----
++    const int64_t n_embd_head = hparams.n_embd_head_v();
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++
++    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
++    cb(Qcur_full, "mtp_Qcur_full", il);
++
++    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
++        ggml_element_size(Qcur_full) * n_embd_head * 2,
++        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
++    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
++    cb(Qcur, "mtp_Qcur_normed", il);
++
++    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
++        ggml_element_size(Qcur_full) * n_embd_head * 2,
++        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
++        ggml_element_size(Qcur_full) * n_embd_head);
++    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
++    cb(gate, "mtp_gate", il);
++
++    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
++    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
++    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
++    cb(Kcur, "mtp_Kcur_normed", il);
++
++    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
++    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
++    cb(Vcur, "mtp_Vcur", il);
++
++    // IMRoPE, same convention and freq_base as the trunk
++    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
++            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++            ext_factor, attn_factor, beta_fast, beta_slow);
++    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
++            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++            ext_factor, attn_factor, beta_fast, beta_slow);
++    cb(Qcur, "mtp_Qcur", il);
++    cb(Kcur, "mtp_Kcur", il);
++
++    const float kq_scale = hparams.f_attention_scale == 0.0f
++            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
++
++    cur = build_attn(inp_attn,
++            nullptr, nullptr, nullptr,
++            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++    cb(cur, "mtp_attn_pregate", il);
++
++    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
++    cb(cur, "mtp_attn_gated", il);
++
++    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
++    cb(cur, "mtp_attn_out", il);
++
++    if (inp_out_ids) {
++        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
++        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
++
++        res_hc = ggml_reshape_2d(ctx0, res_hc, hc_dim, res_hc->ne[2]);
++        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
++        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
++    }
++
++    res_hc = build_hc_combine(res_hc, cur, inject, il);
++    cb(res_hc, "mtp_hc_attn_post", il);
++
++    // ---- MoE, identical to the trunk's build_layer_ffn ----
++    cur = build_hc_mix(res_hc,
++            layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject,
++            &inject, il);
++    cb(cur, "mtp_hc_ffn_pre", il);
++
++    cur = build_layer_ffn(cur, il);
++    cb(cur, "mtp_ffn_out", il);
++
++    res_hc = build_hc_combine(res_hc, cur, inject, il);
++    cb(res_hc, "mtp_hc_ffn_post", il);
++
++    // The next draft step re-enters here, so export the wide stream before it is collapsed.
++    // As in the trunk, export the combine result rather than a reshape view of it.
++    cb(res_hc, "h_nextn", -1);
++    res->t_h_nextn = res_hc;
++
++    // the head's own mixer collapses the streams and doubles as the output norm
++    cur = build_hc_mix(res_hc,
++            layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
++            nullptr, nullptr, -1);
++    cb(cur, "mtp_hc_head", -1);
++
++    // deliberately no res->t_embd: it would be n_embd wide while the context sizes its
++    // embedding buffer by n_embd_out (the wide stream). The driver reads t_h_nextn instead.
++
++    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
++    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
++    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
++
++    cur = build_lora_mm(head_w, cur, head_s);
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++
++    ggml_build_forward_expand(gf, cur);
++}
++
+ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
+                 ggml_tensor * input,
+                         int   il) {
+diff --git a/tools/rpc/rpc-server.cpp b/tools/rpc/rpc-server.cpp
+index 08e680391..f26726827 100644
+--- a/tools/rpc/rpc-server.cpp
++++ b/tools/rpc/rpc-server.cpp
+@@ -170,7 +170,7 @@ static std::string fs_get_cache_directory() {
+ }
+ 
+ struct rpc_server_params {
+-    std::string              host        = "127.0.0.1";
++    std::string              host        = "0.0.0.0";
+     int                      port        = 50052;
+     bool                     use_cache   = false;
+     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+-- 
+2.55.0
+

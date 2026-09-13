@@ -1,0 +1,83 @@
+From 201646d3cbb45acab466fa4c37f914bb84a631a0 Mon Sep 17 00:00:00 2001
+From: "Marcel W. Wysocki" <maci.stgn@gmail.com>
+Date: Sun, 13 Sep 2026 11:39:29 +0800
+Subject: [PATCH 4/4] docs: record the Qwen4Exp reconciliation result and what
+ blocks each baseline
+
+A rebase of the Spark series onto ours stops on the first commit: conversion/qwen4exp.py is an add/add, and seven of eight non-overlapping cherry-picks conflict anyway because the fork point is two weeks behind master.
+
+The two lines are partial variants of each other, so the union needs per-feature decisions. The tensor-parallel Q split, the piece the two-node work needs, is already here.
+
+Assisted-by: Kimi Code
+---
+ docs/targets/README.md | 53 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 39 insertions(+), 14 deletions(-)
+
+diff --git a/docs/targets/README.md b/docs/targets/README.md
+index 14def6996..217f36f87 100644
+--- a/docs/targets/README.md
++++ b/docs/targets/README.md
+@@ -48,21 +48,46 @@ llama.cpp done, single Spark**), `research.md`, `session-log.md`, `vllm-perf.md`
+ 
+ Captured here on 2026-09-13:
+ 
+-- **the Spark-only Qwen4Exp history**, fetched as `refs/remotes/spark-qwen38/*`. Branch `pr-27742`
+-  holds **33 feature commits this repo had never seen**, including `qwen4exp: double the Q split
+-  granularity for tensor parallelism`, the fused-QKV segmentation for tensor split, the indexer cache
+-  tensor names, and a quantized-KV path in QSA. They were unpushed and existed only on spark1.
++- **the Spark-only Qwen4Exp history**, fetched as `refs/remotes/spark-qwen38/*`, and kept as the local
++  branch `qwen4exp-spark`. Branch `pr-27742` holds **33 feature commits this repo had never seen**,
++  dated 2026-08-26/27, which is the whole Qwen4Exp model port series (gguf arch, hparams, text graph
++  with GDN and hyper-connections, PLE n-gram embedding, QSA sparse attention, indexer caches, tensor
++  parallel). They were unpushed and existed only on spark1.
+ - the GLM feasibility note (its repo is local-only and unpushed) and the Qwen3.8 docs above.
+-
+-Still to do, in order:
+-
+-1. **Reconcile the two Qwen4Exp lines.** `spark-qwen38/pr-27742` and this repo's uncommitted tree are
+-   different revisions of the same model work, and they sit on different upstream masters (the Spark
+-   fork point is older). This is a rebase or cherry-pick job, not a copy.
+-2. **Commit what is uncommitted here.** The two-node NCCL work and the Qwen4Exp changes are in the
+-   working tree, so one `git checkout` loses them. There is no push remote for this work yet; the
+-   only remote is upstream `ggml-org/llama.cpp`.
+-3. Measure a baseline per target on this rig using a single protocol for all three.
++- **this repo's accumulated work, now committed** as `580205750` on `unmerged-prs`: 23 files, the
++  two-node NCCL/RPC transport, DFlash2 draft plumbing and the Qwen4Exp iteration that was in the
++  working tree. It had never been committed on that branch.
++
++### The two Qwen4Exp lines: measured, and not mechanically reconcilable
++
++Attempted as a rebase of the Spark series onto our tip. It stops on the **first** commit:
++`conversion/qwen4exp.py` is an **add/add** conflict, because both lines independently wrote that
++converter for the same model. Rerun as individual cherry-picks of the eight commits that touch no file
++we changed, one applied and seven conflicted anyway, because the Spark fork point is two weeks behind
++our master.
++
++What the two lines actually contain:
++
++| | ours (`unmerged-prs`) | the Spark series (`qwen4exp-spark`) |
++|---|---|---|
++| Q split granularity for TP | **present**, `src/llama-model.cpp:743` | present |
++| `indexer_head_size` / indexer cache | present (`llama-hparams.h`, `llama-kv-cache-dsa.cpp`) | present, as its own series of commits |
++| quantized KV cache in the QSA path | not found | `0ac4b1802` |
++| fused-QKV segmentation for tensor split | not found | `5674c73aa` |
++| qwen4exp large-graph node budget | not found | `c52ed2a0b` |
++| two-node RPC and DFlash2 | present, ours | not present |
++
++So they are **partial variants of each other**, not one line and its stale copy, and the union needs
++per-feature decisions rather than `git rebase`. The mission-critical piece, the tensor-parallel Q
++split, is already in ours.
++
++### Baselines: what is servable, and what blocks
++
++| target | weights on the rig | blocker |
++|---|---|---|
++| `deepseek-v4-flash-0731` | yes, `~/models/ds4-flash-0731-gguf/UD-Q4_K_XL` (145 GB, 5 parts) plus the DSpark draft GGUF (11 GB) | 145 GB does not fit one 121 GB Spark, so this needs the two-node RPC path, and it needs a built `llama-server` |
++| `qwen3.8-flash-next` | yes, `~/qwen3.8-flash-next/models/unsloth/.../UD-Q4_K_XL` (210 GB across the main and MTP part sets) plus an MTP Q8_0 draft | the Spark build has `llama-cli` but **no `llama-bench` and no `llama-server`**, so a server-level throughput number needs a build first |
++| `glm5.3-flash` | **no**. The only `glm5next` paths on the rig are vLLM test fixtures under `~/rebase-53425` and `~/proto-check`, not weights | weights must be fetched before anything can be measured |
+ 
+ ## Provenance
+ 
+-- 
+2.55.0
+
