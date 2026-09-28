@@ -1,0 +1,70 @@
+Two GB10 over ggml-rpc-server (backend CUDA,RPC), peer 10.0.1.2:50052, RDMA over RoCE.
+Model as in deepseek-v4-two-node-rpc.txt: DeepSeek-V4-Flash-0731 UD-Q4_K_XL (unsloth), 5 shards,
+144.44 GiB, 284.33 B params, -ngl 99, -c 4096, default (layer) split. New here: the DSpark draft
+is loaded with -md and --spec-type draft-dspark, which the README recorded as not yet wired to a
+two-node run.
+
+   -md ~/models/ds4-flash-0731-gguf/dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf
+   -ngld 99 --spec-type draft-dspark --spec-draft-n-max 7
+
+The workload is the same one the vLLM reference is measured with, so the two are comparable:
+chat completion, the shared BST coding prompt, temperature 0.7, seed 1234, thinking off,
+max_tokens 512, one stream, throughput = completion tokens / wall time.
+
+--- 2026-09-13, draft-depth sweep, one 512-token pass per arm, one model load per arm ---
+
+| --spec-draft-n-max | c1 tok/s | tokens per pass (mean len) | draft acceptance |
+|---|---|---|---|
+| none (no draft)    |     14.8 |                      1.00 |                - |
+|                  1 |     20.0 |                      1.92 |           92.1 % |
+|                  3 |     22.0 |                      3.38 |           79.5 % |
+|                  7 |     22.8 |                      4.41 |           68.6 % |
+|                 15 |     23.2 |                      4.41 |           68.6 % |
+
+n_max 15 returns the identical draft counts as n_max 7 (395 accepted of 576, mean len 4.41), so
+draft depth saturates there and the sweep is flat from 7 on. The n_max 3 arm is from the same
+server build and protocol earlier the same day.
+
+--- 2026-09-13, n_max 7, three passes at 512 tokens ---
+
+  pass 1   23.1 tok/s    wall 22.1 s
+  pass 2   24.8 tok/s    wall 20.7 s
+  pass 3   25.6 tok/s    wall 20.0 s
+  median   24.8 tok/s    spread 23.1 - 25.6
+
+The three passes rise monotonically, so the first pass pays a cold cost; the reference harness
+warm-warms before its three measured passes and this run does not.
+
+Confirmation run, same build restored from the same sources and rebuilt, 2026-09-13 20:54:
+21.6 / 25.9 / 25.3 tok/s, median 25.3, same gates. Two independent three-pass runs of this
+configuration give medians 24.8 and 25.3, so the number to quote is about 25 tok/s with a run-to-run
+spread near +/-8 %.
+
+Gates, greedy, same server: gate_france ` Paris. The capital of Spain`, gate_9x8 `72, 9x9`.
+Both match the vLLM reference harness output byte for byte, so the draft is not changing the
+model's answers.
+
+--- where the gap is ---
+
+The reference (vLLM refg, anemll 0.1.1, DSpark, TP=2, same pair, same protocol) is
+63.1 / 112.1 / 140.9 / 156.0 at c1/c3/c5/c6, and its own step counters put c1 at 74.9 ms per
+step and 4.70 tokens per step. This run is 4.41 tokens per pass at 43.1 ms per token, that is
+190 ms per pass. So the two engines verify a comparable number of tokens per step; the gap is
+per-step cost, 2.5x, and it is not an acceptance problem.
+
+The per-pass cost of the layer split is bounded below by the target's own weight traffic. Decode reads
+roughly 6 GB of active weights per token: 7 of 256 experts per layer at MXFP4 (137.06 of the file's
+144.44 GiB is MXFP4, measured from the shards with gguf-py), plus attention and the Q8_0 output head.
+A layer split puts node A's half and node B's half in series, not in parallel, so a token pays one
+node's full pass over that traffic. Upstream llama.cpp gets 169 GB/s on this same box for the same
+MXFP4 MoE shape (gpt-oss-120b: 59.02 GiB, 116.83 B total, tg32 58.72 tok/s in
+benches/dgx-spark/dgx-spark.md, which is 2.87 GB of active weights per token), and that rate puts the
+floor for this model near 35 ms per token before any draft work.
+
+Measured here: 67.6 ms per token with no draft, 43.1 ms per token at n_max 15, against the 15.9 ms
+per token the reference needs. The tensor-parallel path that would make the two nodes work on the
+same token is implemented (see bench/glm53-split-detail.txt and the SESSION_STATE history on spark1)
+but is allreduce-latency bound over this RoCE link: 12.8 tok/s without a draft and 21.9 tok/s with
+the DSpark draft, both `llama-cli` at 2048 ctx, i.e. no better than the layer split. llama-server
+could not be used for a like-for-like TP arm on 2026-09-13: llama_params_fit is not implemented for
+SPLIT_MODE_TENSOR, so the load did not finish inside the run's timeout.

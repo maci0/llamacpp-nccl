@@ -1,0 +1,130 @@
+Single-node DeepSeek-V4-Flash-0731 on one GB10, no RPC and no layer split, with the DSpark draft.
+Two quants in one record: `UD-Q2_K_XL` (90.2 GiB), which is the best configuration measured so far,
+and `UD-IQ1_S` (76.9 GiB), which is not faster.
+
+Why this configuration: the two-node layer split costs nothing extra but buys nothing either. Both
+nodes together read the same per-token weight traffic as one node would (each half of the layers, in
+series), so the split is capacity, not speed, and it adds the RPC handoffs. The lever that does change
+the per-token cost is the number of bytes the weights occupy, so this arm runs a quant that fits in one
+Spark: UD-Q2_K_XL, 90.2 GiB in 3 shards, against UD-Q4_K_XL's 144.44 GiB.
+
+  ./build/bin/llama-server \
+      -m ~/models/ds4-flash-0731-gguf/UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf \
+      -ngl 99 -c 4096 --host 127.0.0.1 --port 8081 \
+      -md ~/models/ds4-flash-0731-gguf/dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf \
+      -ngld 99 --spec-type draft-dspark --spec-draft-n-max 5
+
+Same golden workload as the other DeepSeek records: chat completion, BST coding prompt, temperature
+0.7, seed 1234, thinking off, 512-token generations, three passes per level, medians reported.
+
+--- 2026-09-13, three passes at each level, -c 4096 (auto n_parallel = 4) ---
+
+| level | pass 1 | pass 2 | pass 3 | median | reference (vLLM refg) |
+|---|---|---|---|---|---|
+| c1 | 40.6 | 40.0 | 39.9 | **40.0** | 63.1 |
+| c3 | 45.4 | 59.9 | 46.5 | 46.5 | 112.1 |
+| c5 | 61.2 | 60.2 | 60.3 | 60.3 | 140.9 |
+| c6 | 55.1 | 62.3 | 54.8 | 55.1 | 156.0 |
+| sum | | | | 201.9 | 472.1 |
+
+c1 is the stable one: 39.9-40.6, a spread of 1.5 %, against the two-node configuration's 8 %. There is
+no RPC and no second machine in the loop, so there is much less to vary.
+
+--- 2026-09-13, same serve with -c 16384 -np 8 (8 slots, 2048 ctx each) ---
+
+| level | pass 1 | pass 2 | pass 3 | median | vs the arm above |
+|---|---|---|---|---|---|
+| c1 | 37.4 | 38.8 | 39.1 | **38.8** | -3 % (inside spread) |
+| c3 | 58.0 | 66.2 | 64.2 | **64.2** | +38 % |
+| c5 | 76.5 | 82.7 | 71.8 | **76.5** | +27 % |
+| c6 | 81.5 | 79.0 | 79.9 | **79.9** | +45 % |
+| sum | | | | **259.4** | +28 % |
+
+--- 2026-09-13, the same again with GGML_CUDA_GRAPH_OPT=1 ---
+
+| level | pass 1 | pass 2 | pass 3 | median | vs the arm above |
+|---|---|---|---|---|---|
+| c1 | 37.5 | 38.6 | 38.5 | **38.5** | -1 % |
+| c3 | 57.6 | 65.7 | 64.3 | **64.3** | 0 % |
+| c5 | 80.5 | 79.1 | 78.1 | **79.1** | +3 % |
+| c6 | 82.1 | 83.2 | 80.9 | **82.1** | +3 % |
+| sum | | | | **264.0** | +2 % |
+
+`GGML_CUDA_GRAPH_OPT` turns on the additional graph-optimization pass in `ggml-cuda.cu`
+(`ggml_cuda_graph_opt`, the env is read at line 4647), which can overlap independent work inside the
+captured graph. The effect is real but small: c1 is unchanged and the concurrency levels gain a couple
+of percent. Gates unchanged. Worth keeping as a serving flag, not worth calling a fix.
+
+The first arm was slot-limited, not engine-limited: with the default 4 slots a level of 5 or 6 has to
+queue requests. The slot count is a serving parameter, so the levels below c2 say nothing about the
+engine. Above c1 the second arm is the configuration to quote, and its sum is the better half of the
+comparison the reference uses.
+
+Draft effect on this configuration: with no draft the same server gives 19.4 / 19.8 / 19.8 at c1,
+median 19.8, so the draft is worth 2.0x here. Acceptance is higher than in the two-node arm: 74.2 %
+accepted, mean draft length 4.69 of the block's 5 (the two-node Q4 arm gets 68.6 % and 4.41).
+
+Gates, greedy, same server: `gate_france` -> ` Paris. The capital of France`, `gate_9x8` -> `72, 8x9`.
+Both answers are correct, so the gates pass; the continuations differ from the reference harness
+(` Paris. The capital of Spain`, `72, 9x9`), which is expected between engines and quants.
+
+--- the quant ladder ends here: UD-IQ1_S, three passes at each level, -np 8 ---
+
+`UD-IQ1_S` is 76.9 GiB, 15 % fewer bytes per token than `UD-Q2_K_XL`, and it is not faster:
+
+| level | pass 1 | pass 2 | pass 3 | median | `UD-Q2_K_XL` |
+|---|---|---|---|---|---|
+| c1 | 35.7 | 38.1 | 38.4 | **38.1** | 38.8 |
+| c3 | 55.9 | 63.3 | 61.1 | **61.1** | 64.2 |
+| c5 | 78.2 | 75.2 | 77.4 | **77.4** | 76.5 |
+| c6 | 81.9 | 81.0 | 81.7 | **81.7** | 79.9 |
+| sum | | | | 258.3 | 259.4 |
+
+The two are the same within the spread, so the 15 % fewer bytes are exactly cancelled by the IQ
+kernel path and by a worse draft: acceptance drops from 74.2 % to 55.4 %, mean draft length from 4.69
+to 3.76. The gates also degrade visibly: `gate_france` returns ` Paris.", "target": "` and `gate_9x8`
+returns `72 (2) 8`. Both still start correctly, so they technically pass, but that is degraded output,
+not a usable configuration. `UD-Q2_K_XL` is the sweet spot and the smaller quant buys nothing.
+
+--- the bandwidth underneath, and the ceiling ---
+
+The same build under `llama-bench` (`-p 512 -n 32 -r 2`, single node, no draft):
+
+```
+  pp512   378.95 +- 7.23 t/s
+  tg32     20.51 +- 0.14 t/s
+```
+
+Per token the decode reads about 3.87 GB of active weights (6.2 GB at `UD-Q4_K_XL`, scaled by
+90.18/144.44). That gives 79 GB/s for the one-token-per-pass decode, 165 GB/s for the speculative arm
+with five tokens per pass, and about 209 GB/s for the two-node `UD-Q4_K_XL` arm. The rate rises with
+the batch, so at one token a pass this build is latency-bound, not bandwidth-bound.
+
+The reference needs 63.1 tok/s at c1: 74.3 ms for a pass that generates 4.69 tokens and verifies five.
+At 200-210 GB/s, five tokens of active weights have to fit in what is left after overhead, which means
+2.4-3.0 GB per token. `UD-Q2_K_XL` reads 3.87 GB and `UD-IQ1_S` 3.3 GB, so no single-Spark
+configuration reaches the bar, and the smaller quant is still 10-25 % short before its quality cost.
+
+Splitting across both nodes does fit that budget: each node would read 1.65-1.94 GB per token, around
+10 ms at these rates. What does not fit is the coordination. The measured implementations spend 35-63 ms
+per token on it (upstream's async RPC design and ours respectively) against the roughly 6 ms per token
+that would leave the whole budget intact. That is the gap to close, and it is engine work rather than a
+configuration or a quant.
+
+--- what this number is and is not ---
+
+It is a real gain: the previous best for this model on this repo was 24.8 / 25.3 tok/s at c1 with the
+two-node UD-Q4_K_XL arm, so this configuration is 1.6x faster at c1 while using one machine instead of
+two, and it also fixes a serving-side cap that had nothing to do with the engine. With
+`GGML_CUDA_GRAPH_OPT=1` it measures 38.5 / 64.3 / 79.1 / 82.1, sum 264.0, which is the configuration to
+quote.
+
+It is not a like-for-like comparison with the reference. The reference serves an NVFP4-class
+checkpoint (about 4.5 bits per weight); this runs 2.72 bits per weight, so it reads roughly 40 % fewer
+bytes per token and its output quality is lower by an unquantified amount. The gates are trivial
+questions and say nothing about that. Any claim built on this number has to carry that caveat, in the
+same way the GLM row already carries it for `UD-IQ1_S`.
+
+Against the reference it is still behind everywhere: 38.8 against 63.1 at c1, 64-80 against 112-156
+once there is concurrency. It is close to our own vLLM at c1 (42.0) and behind it at c3-c6
+(79.3 / 109.1 / 122.8).

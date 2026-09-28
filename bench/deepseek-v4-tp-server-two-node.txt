@@ -1,0 +1,198 @@
+Two GB10 over ggml-rpc-server (backend CUDA,RPC), peer 10.0.1.2:50052, RDMA over RoCE.
+Model: DeepSeek-V4-Flash-0731 UD-Q4_K_XL (unsloth), 5 shards, 144.44 GiB, 284.33 B params, 137.06 of
+the 144.44 GiB MXFP4, -ngl 999, plus the DSpark draft head (10.53 GiB, one 256-expert layer, also
+MXFP4). Device split under tensor parallel, from the server log: Meta() model buffer 74451.44 MiB
+split over CUDA0 and RPC0, draft on the same pair.
+
+This is the first two-node *server* run in tensor-parallel mode, and the fastest 4-bit configuration
+measured so far on this pair. The earlier TP arm was llama-cli only, because a tensor-parallel
+`llama-server` load was written off as unusable in `bench/deepseek-v4-tensor-parallel-async.txt`.
+Rechecked today: `common/fit.cpp` throws "llama_params_fit is not implemented for SPLIT_MODE_TENSOR",
+but `common_fit_params` catches that and only warns (common/fit.cpp:894), so that throw does not stop
+the load. Whether the earlier attempt died of the timeout or of something else is not recoverable from
+here; what is measured is that a two-node TP load takes 16.5 minutes (below), which is the number to
+budget. `--fit off` skips the throw altogether.
+
+  ./build/bin/llama-server \
+      -m ~/models/ds4-flash-0731-gguf/UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf \
+      --rpc 10.0.1.2:50052 --split-mode tensor -ngl 999 -fa on -ctk f16 -ctv f16 \
+      -c 4096 -np 8 --no-warmup --fit off --verbose \
+      -md ~/models/ds4-flash-0731-gguf/dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf \
+      -ngld 999 --spec-type draft-dspark --spec-draft-n-max 5
+
+Same golden workload as every other DeepSeek record: chat completion, BST coding prompt, temperature
+0.7, seed 1234, thinking off, 512-token generations, gates greedy. `--verbose` is for the
+speculative statistics, not for the measurement.
+
+--- 2026-09-14, golden protocol, one warm pass then three passes per level ---
+
+     label=tp-dspark-nmax5 base=http://127.0.0.1:8081/v1 model=deepseek-v4-flash
+     gate_france: ' Paris. The capital of Spain'
+     gate_9x8: '72, 9x9'
+     c1   median=  34.3 tok/s  min=  31.4  max=  36.3  spread=14.4 %  walls=13.4 14.1 15.5
+     c3   median=  62.4 tok/s  min=  60.0  max=  63.8  spread= 6.1 %  walls=23.0 23.5 24.4
+     c5   median=  77.6 tok/s  min=  77.0  max=  80.3  spread= 4.2 %  walls=30.4 31.4 31.5
+     c6   median=  82.2 tok/s  min=  80.1  max=  87.4  spread= 8.9 %  walls=33.5 35.6 36.6
+
+Later sessions re-measured the same configuration, same flags, at c1 = 37.6 (35.9 - 37.6), 35.6 (33.9 -
+36.6) and 36.5 (34.2 - 36.7), three reps each, so read c1 for this arm as about 36 with a session band
+of 34 to 38 rather than as 34.3. Within one session three reps land inside a 4 to 8 % spread; between
+sessions the same configuration moves about 10 %. See `bench/deepseek-v4-tp-coordination.txt`.
+
+Both gates match the reference harness's strings byte for byte, so the TP path is producing the same
+answers as vLLM and as the layer-split arms. Walls are the harness's own per-pass wall times, sorted;
+where a wall does not equal 512/tok/s the generation stopped early on EOG.
+
+Against the reference and against what was published before:
+
+| configuration | c1 | c3 | c5 | c6 | sum |
+|---|---|---|---|---|---|
+| vLLM refg (anemll 0.1.1, DSpark, TP=2) | 63.1 | 112.1 | 140.9 | 156.0 | 472.1 |
+| this run, two-node TP + DSpark, server | 34.3 | 62.4 | 77.6 | 82.2 | 256.5 |
+| two-node layer split + DSpark, server | 24.8 | | | | |
+| single-Spark UD-Q2_K_XL + DSpark, server | 38.5 | 64.3 | 79.1 | 82.1 | 264.0 |
+| single-Spark UD-Q2_K_XL + DSpark, server, 3 reps | 40.0 | 46.5 | 60.3 | 55.1 | 201.9 |
+
+So the 4-bit two-node arm now sits level with the 2.72 bpw single-node arm at c3 to c6 and 14 % behind
+it at c1, while using the 4-bit weights the goal is written against. It is 38 % above the layer split
+at c1, which is the same build and the same draft on the same two nodes.
+
+--- where the 131 ms per pass goes ---
+
+The server's own speculative statistics at the end of the c1 runs, 436 draft calls:
+
+    statistics draft-dspark: #calls(b,g,a) = 6 436 436, #gen tokens = 2168, #acc tokens = 1525,
+    #mean acc len = 4.50, #acc rate/pos = (0.933, 0.839, 0.706, 0.606, 0.413),
+    dur(b,g,a) = 0.017, 8999.659, 0.176 ms
+
+- mean accepted length 4.50 against the reference's 4.70 tokens per step, so acceptance is not the gap;
+- drafting costs 20.6 ms per pass (8999.659 ms over 436 calls), accepting costs 0.18 ms total;
+- c1 is 34.3 tok/s = 29.2 ms per token = 131 ms per pass at 4.50 tokens;
+- the verify pass is therefore ~110 ms, against llama-bench's 78 ms for a five-token TP pass and
+  43 ms for a one-token one (bench/deepseek-v4-tensor-parallel-async.txt).
+
+The marginal cost of an extra token in the verify pass is (110 - 43) / 5 = 13 ms, where the
+prefill-side slope over the same node pair is 3.4 ms per token. That difference is the shape of this
+model, not a bug in the server: with 256 experts and top-6, each token the batch carries pulls in up
+to 6 more expert matrices, so a six-token verify reads roughly five times the expert weight bytes a
+one-token pass does while the dense bytes stay flat. Speculative decoding is therefore worth much
+less here than on a dense model, and the acceptance rate is not where the remaining time is.
+
+--- negative result: the draft head cannot be pinned to one device today ---
+
+Pinning the draft to the local node (`-devd CUDA0`, which loads it as "CUDA0 model buffer size =
+10785.66 MiB" instead of the Meta() split) aborts while the draft context is reserved:
+
+    ggml-backend.cpp:941: pre-allocated tensor (output.weight) in a buffer (Meta()) that cannot run
+    the operation (NONE)
+    #3 ggml_backend_sched_backend_id_from_cur
+    #4 ggml_backend_sched_split_graph
+    #5 llama_context::graph_reserve
+    #6 llama_context::resolve_fused_ops
+    #7 llama_context::sched_reserve
+
+`output.weight` is pre-allocated in a Meta() buffer because tensor parallel with a full-output
+ranking drafter sets `output_replicated` (common/common.cpp:1299); a draft context restricted to one
+device then has no backend that can run it. The draft costs 20.6 ms of the 131 ms pass, so the
+device pinning was worth about 7 % of throughput; it is not available without a fix to that
+interaction.
+
+--- load cost ---
+
+16 minutes 30 seconds for the main model plus the draft, 16.5 of those minutes before the server
+starts listening. Measured during the load: 155 GiB of reads at 100 to 160 MiB/s from nvme0n1, the
+first ~108 GiB from page cache. So an arm costs 17 minutes of load plus the measurement, which is
+what sets the pace of this work; anything that needs a fresh process should be batched.
+
+Reliability, added after the fact: three consecutive attempts to bring this arm up failed on spark1,
+each four to five minutes into the load, with the client's log truncated at `loading model` (buffered
+output lost, which is the signature of an ungraceful kill) while the RPC peer survived and logged
+`Client connection closed`. `dmesg` is empty, there is no core for it in `/var/crash`, and the box
+reports 117 GB free with 1 GB of page cache, so it is not memory. The same command completed four times
+earlier the same day, so it is intermittent rather than a configuration change. The next attempt should
+run the load in the foreground with stderr on screen rather than redirected, so the reason is not lost
+to buffering, and should try `--no-mmap`; if both fail the same way, the arm is not measurable until
+that is understood.
+
+--- next, in the order the numbers put them ---
+
+1. The verify pass, not the draft, is 84 % of the pass. Within it, the MoE expert matmuls at batch 6
+   are the item to attack: `mmvq.cu` already carries a DGX Spark (GB10) parameter table and a
+   MUL_MAT_ID batch cutoff of 7 for MXFP4, so this batch size sits in the MMVQ path, and
+   `patches/0005` (upstream PR #28003) is the same optimisation for RDNA3 single-token dispatch.
+   A load-free microbenchmark of MUL_MAT_ID at the MXFP4 shapes this model uses, against the part's
+   232 GiB/s measured here, would say whether the kernel or the traffic is the limit.
+2. RPC message count per token: ~87 allreduces and ~85 subgraphs. `GGML_RPC_DEBUG` on the RPC server
+   plus the log timestamps gives the per-request timeline without `perf`, which is blocked on this
+   pair (`ptrace` and `perf_event` are both denied to this user).
+3. The draft's 20.6 ms is mostly its own full-vocabulary ranking at five positions; `--spec-draft-n-max`
+   below 5 loses more acceptance than it saves (rate 0.413 at position 5), so leave it.
+
+--- 2026-09-14, slot count at c1: two slots beat eight, and the reason to care ---
+
+The arm above runs `-np 8`. The single-Spark Q2 record showed the slot count moving c1 in the same
+direction (40.0 at four slots against 38.5 at eight), so the tensor-parallel path was measured the same
+way, same flags but `-np 2 -c 4096` (which makes each slot's context 2048 rather than 512):
+
+| c1, three reps | median | range | spread |
+|---|---|---|---|
+| `-np 8` (published band, four sessions) | 34.3 - 37.6 | | 4 - 14 % |
+| `-np 2`, first run | 40.7 | 39.8 - 41.1 | 3.2 % |
+| `-np 2`, second run | 40.3 | 39.0 - 41.1 | 5.1 % |
+
+Gates identical in both. That is about 13 % on the c1 headline and the tightest spread measured on this
+arm. It is a trade, not a free win: at three concurrent streams with only two slots, c3 falls to 47.2
+(45.1 - 49.1) against 62.4 at eight slots, because the third request queues. So the slot count has to
+match the intended concurrency: two slots for single-stream service, eight for the levels above c1.
+Nothing else was changed, so the multi-level table above stays the `-np 8` configuration.
+
+Also recorded here because it cost three turns: the load is intermittently fatal. Three attempts died
+four to five minutes in with the client's log truncated (see the reliability note above); the fourth,
+launched with `stdbuf -oL -eL` so a kill cannot eat the buffered lines, completed in 17.1 minutes with
+no other change.
+
+One more data point from the same load, for scale: at two slots, c2 (two streams, exactly filling the
+slots) gives 56.8 tok/s median (53.5 - 58.4), so the configuration scales to its own slot count and
+then falls off, which is what the c3 result above shows from the other side.
+
+--- 2026-09-14, four slots: worse at both c1 and c3, and c3 looks serialized ---
+
+Same arm, same flags, `-np 4 -c 4096` (1024 tokens per slot), three reps per level:
+
+| level | `-np 4` | for comparison |
+|---|---|---|
+| c1 | 36.8 (36.0 - 36.9), spread 2.4 % | 40.4 at `-np 2`, 34.3 - 37.6 at `-np 8` |
+| c3 | 31.5 (31.3 - 32.7), spread 4.6 %, walls 46.9 / 48.7 / 49.1 s | 62.4 at `-np 8`, walls 23.0 / 23.5 / 24.4 s |
+
+So four slots is worse than two at c1 and much worse than eight at c3. The c3 wall is the part worth
+recording: 1536 tokens in 47 s at four slots against 1536 in 24 s at eight. Forty-seven seconds is
+what three *serial* 512-token generations cost at the c1 rate, so at four slots the three concurrent
+requests appear to be processed one after another rather than batched into one pass. Why eight slots
+batch and four do not is not explained by anything measured here, and it is the first thing to look at
+if these levels matter: it suggests a batching or admission condition in the server that depends on the
+slot count, not a throughput property of the model.
+
+c1 results across the three slot counts, which is the trend the goal's headline level follows:
+
+| slots | c1 median | range | spread |
+|---|---|---|---|
+| 2 | 40.7 / 40.3 | 39.0 - 41.1 | 3 - 5 % |
+| 4 | 36.8 | 36.0 - 36.9 | 2.4 % |
+| 8 | 34.3 - 37.6 (four sessions) | | 4 - 14 % |
+
+--- 2026-09-14, 4-bit KV cache: no help at these context lengths ---
+
+The arm above caches K and V as f16. The reference image serves the same model with an NVFP4 MLA KV
+cache, so a 4-bit cache was the obvious next thing to try: same flags, same two slots, `-ctk q4_0
+-ctv q4_0`, three reps at c1.
+
+| c1, three reps | median | range | spread |
+|---|---|---|---|
+| `-ctk f16 -ctv f16` | 40.4 (two runs: 40.7, 40.3) | 39.0 - 41.1 | 3 - 5 % |
+| `-ctk q4_0 -ctv q4_0` | 38.9 | 36.7 - 38.9 | 5.7 % |
+
+Gates identical. So it is a small loss rather than a gain, which is what the accounting predicts at
+these context lengths: with 512-token generations the attention reads on the order of 20 MB of KV per
+token against the 10.4 GiB of weights, so halving the cache buys almost nothing while adding
+dequantisation work inside the attention path. Where a 4-bit cache should pay is long context, where
+KV traffic stops being noise; the protocol used for the bar does not reach that regime.

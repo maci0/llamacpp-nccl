@@ -1,0 +1,58 @@
+---
+nsys profile of the single-node Q2 arm, same method as bench/deepseek-v4-profile-two-node.txt
+(spark1 only; `nsys profile --cuda-graph-trace=node`, one 512-token generation, 34.9 tok/s under the
+profiler against 38.8 without it).
+
+--- the GPU is busy here, unlike on the layer split ---
+
+| | two-node UD-Q4_K_XL layer split | single-node UD-Q2_K_XL |
+|---|---|---|
+| GPU busy over the decode | 37.4 % (client) / 41.1 % (server) | **86.1 %** |
+| kernel time in the window | 8.35 s of 22 s | 13.27 s of 15 s |
+
+So on one node the engine keeps the GPU fed; the two-node arm's low occupancy was the layer split
+serialising the machines, not a shortage of work.
+
+--- where the GPU time goes (15 s window, 13.27 s of kernels) ---
+
+| kernel | ms | share | calls | us/call |
+|---|---|---|---|---|
+| mul_mat_vec_q_moe<IQ2_XS, 2, true> | 2984.9 | 22.5 % | 4620 | 646.1 |
+| mul_mat_vec_q_moe<IQ2_S, 2, false> | 1806.5 | 13.6 % | 4510 | 400.5 |
+| mul_mat_vec_q<Q8_0, 6> | 3072.9 | 23.1 % | 34344 | 89.5 |
+| concat_cont<uint> | 607.7 | 4.6 % | 47048 | 12.9 |
+| k_set_rows<float, int, float> | 432.3 | 3.3 % | 41292 | 10.5 |
+| mul_mat_f<bf16> (draft) | 401.2 | 3.0 % | 2943 | 136.3 |
+| mul_mat_vec_q_moe<MXFP4, 2> (draft) | 619.6 | 4.7 % | 874 | 480-1090 |
+| k_get_rows_float* | 402.9 | 3.0 % | 62926 | 2-14 |
+| quantize_q8_1 | 153.4 | 1.2 % | 64123 | 2.4 |
+| flash_attn_ext_f16 | 139.1 | 1.0 % | 5014 | 27.7 |
+
+Two facts worth keeping:
+
+- the expert matvecs are already near the memory limit: one `mul_mat_vec_q_moe` call is about
+  140 MB of IQ2 weights across the batch's ~28 distinct experts in 646 us, which is roughly 215 GB/s,
+  near this part's 273 GB/s. Note also that Unsloth's `UD-Q2_K_XL` puts IQ2_XS/IQ2_S in the experts,
+  not Q2_K;
+- the shortfall is elsewhere. Across the whole pass the kernels move the ~19.35 GB of active weights
+  in ~122 ms of kernel time, which is 159 GB/s, or 58 % of peak. The 23 % spent on 34344 small Q8_0
+  matvecs (89 us each) is where the efficiency goes: those are the per-layer projections, small enough
+  at a five-token batch to be memory-latency bound rather than bandwidth bound, the same effect that
+  shows as 79 GB/s at one token per pass and 165 GB/s at five.
+
+--- the structural difference from the reference ---
+
+The reference serves this model at 63.1 tok/s with tensor parallelism across both Sparks, so both
+machines work on the same five or so verified tokens at once. This arm uses one machine. That is the
+whole of the 1.6x, and it is why closing it needs parallelism rather than more tuning:
+
+- tensor parallelism on this model would halve the per-node traffic to about 1.9 GB per token, around
+  12 ms at 165 GB/s, which fits the 74 ms a pass has at the reference's rate;
+- what does not fit is the coordination. This fork spends about 74 ms per pass on it (~106 collectives
+  at ~0.7 ms, measured on the UD-Q4_K_XL arm) and upstream's async design measures 50.6 ms per token
+  without a draft, so roughly 30 ms per pass. The budget is about 15 ms per pass.
+
+So the remaining work is the collective path, not the model, the quant, or the serving flags. The
+measured options are: our synchronous NCCL-over-RPC (worst), upstream PR #26610's fire-and-forget
+server-to-server design (about 2x better than ours on this hardware), and what vLLM already does
+(both nodes on every token with the collectives overlapped, which is the 63.1 this is compared with).

@@ -1,0 +1,246 @@
+One GB10, no RPC, no model loaded for the measurement itself. This file records how to get a per-op
+profile on this pair without `perf` or `nsys`, and what the first such profile says about the 4-bit
+two-node decode.
+
+Why this route: `perf` is blocked (`perf_event_paranoid`), `ptrace` is denied so `strace` cannot
+attach, and an unbounded `nsys` capture of a tensor-parallel decode came out 1.5 GB. Upstream ships a
+pair of tests that between them do the job offline:
+
+    cmake --build build -j16 --target test-export-graph-ops test-backend-ops
+    ./build/bin/test-export-graph-ops -m <model.gguf> -c 512 -np 6 -ngl 0 -o .scratch/gq4.txt
+    ./build/bin/test-backend-ops perf --test-file .scratch/gq4.txt -b CUDA0 -o MUL_MAT,MUL_MAT_ID
+
+`test-export-graph-ops` loads the model metadata only (`set_tensor_data` is a noop, so weights are
+never read), reserves the prompt and generation graphs and writes their op descriptions out.
+`test-backend-ops perf --test-file` then allocates tensors of those exact shapes on the chosen backend
+and times each op. With `-np 6` the generation graph is the six-token batch a DSpark verify uses.
+Console output is the useful format; `--output csv` in this tree carries no timing column.
+Exporting the 144.44 GiB UD-Q4_K_XL takes about a minute because nothing but metadata is touched, so
+this is a seconds-scale loop where a model load is 17 minutes.
+
+Model: DeepSeek-V4-Flash-0731 UD-Q4_K_XL, 43 blocks, n_embd 4096, 256 experts, top-6, expert ffn
+2048. 8454 nodes, 270 unique ops. What the report prints is bytes moved per run and GB/s, which is the
+achieved bandwidth of that op.
+
+--- 2026-09-14, six-token generation graph, CUDA0 on GB10 ---
+
+Dense projections, q8_0 weights, six tokens per pass:
+
+| op (tensor) | bytes/run | us/run | GB/s |
+|---|---|---|---|
+| q8_0[4096, 64] | 369 kB | 10.05 | 35 |
+| q8_0[4096, 256] (`lid_state_kv`) | 1190 kB | 10.74 | 106 |
+| q8_0[4096, 512] | 2284 kB | 10.67 | 204 |
+| q8_0[4096, 1024] (`qr`) | 4472 kB | 11.01 | 387 |
+| q8_0[4096, 2048] (`ffn_gate`) | 8848 kB | 15.17 | 556 |
+| q8_0[2048, 4096] (`ffn_shexp`) | 8848 kB | 16.91 | 499 |
+| q8_0[1024, 8192] | 8920 kB | 19.36 | 439 |
+| q8_0[4096, 1024, 8] (`attn_wo_a`) | 35776 kB | 161.12 | 212 |
+| q8_0[8192, 4096] (`attn_out`) | 35104 kB | 163.29 | 205 |
+| q8_0[1024, 32768] | 35608 kB | 154.23 | 220 |
+| q8_0[4096, 129280] (`result_output`, the lm head) | 552566 kB | **2421.59** | 218 |
+
+MoE, mxfp4 experts, six tokens, six used:
+
+| op | experts | us/run |
+|---|---|---|
+| `ffn_moe_gate` mxfp4[4096,2048,256] | 6 of 256 | 189.53 |
+| `ffn_moe_down` mxfp4[2048,4096,256] | 6 of 256 | 230.51 |
+| the same two at a 516-token batch | 6 of 256 | 1083.65 / 1087.03 |
+
+What the profile says:
+
+- Every op lands on a floor near 10 us whatever its size: 369 kB takes 10.05 us and 4472 kB takes
+  11.01 us. That floor is per-op latency inside a replayed CUDA graph, not bandwidth. The generation
+  graph has roughly a thousand executable ops, so on the order of 10 ms of a pass is this floor.
+- The large dense projections run at 205 to 220 GB/s, against the 232 GB/s this pair measures for a
+  five-token pass and 273 GB/s of peak. There is no bandwidth headroom left in `attn_wo_a`,
+  `attn_out`, `node_19` or the lm head.
+- The lm head is the single most expensive op in the graph: 2.4 ms per pass for six output rows,
+  because it re-reads its 552 MB of q8_0 weights. It appears once for the target verify and five more
+  times for the draft's full-vocabulary ranking, which is most of the draft's measured 20.6 ms.
+- The rows above 230 GB/s are L2 effects, not real: each op is re-run in a tight loop, so its weights
+  stay resident. Values up to several TB/s appear that way. Treat the small-op and MoE rows as
+  latency and shape information only.
+
+Caveats that matter before drawing conclusions:
+
+- The exporter writes shapes, not data, so `MUL_MAT_ID` draws random expert ids. A real six-token
+  batch from one sequence shares experts between tokens; random ids do not, so this profile touches
+  more distinct experts than a real verify does.
+- The replay cannot see the coordination: no RPC round trip, no allreduce, no sampling, no draft
+  scheduling. The sum of the timed ops is therefore a floor for the pass, not the pass.
+
+What it rules out: a better kernel for the expert matvecs at this batch size. The incremental slope of
+the two-node arm is 8.75 ms per extra token (43 ms at one token, 78 at five, from
+`bench/deepseek-v4-tensor-parallel-async.txt`), against 7.4 ms per node predicted for six experts per
+token per layer at 232 GB/s, so the MoE path is already at roughly 85 % of what the part can move. The
+dense path is at 205 to 220 GB/s on the big tensors. Both are close to the memory system, which is why
+the remaining gap is not in the matmul kernels.
+
+What it points to, with the earlier per-pass accounting (131 ms per pass, 110 ms of it verify, 20.6 ms
+draft, 4.50 tokens accepted): the fixed cost of a pass. At the measured marginal of 8.75 ms per token,
+a 4.50-token pass should cost about 39 ms of weight traffic; it costs 131 ms. The difference is per-op
+latency floors, the 2.4 ms lm head, the draft's full-vocabulary rankings, and the coordination the
+replay cannot see (~87 allreduces and the subgraph round trips). That is where the next engineering
+goes, and this route makes each attempt measurable in seconds instead of a 17-minute load.
+
+--- 2026-09-14, a per-pass budget: multiplicities joined to the replay ---
+
+The replay above times one occurrence of each *unique* op, and the generation graph has 5208
+non-view nodes, so the times only become a pass budget once each signature is multiplied by how often
+it appears. The exporter now prints that: `tests/test-export-graph-ops.cpp` gained a multiplicity
+counter (local change, `MULT <count> <op> <type> <ne...>` on stderr, one line per signature), and
+`scripts/op-budget.py` joins the two files. Costs a minute to export and two to replay, no model load.
+
+Grep of the exporter's multiplicities, six-token generation graph: 133 unique signatures, 5208 nodes.
+Budget for one pass on one device, from the replay times (L2-favourable, see the caveat above):
+
+| op family | nodes | ms/pass | share of timed |
+|---|---|---|---|
+| `MUL_MAT` (dense projections) | 683 | 22.3 | 52 % |
+| `MUL_MAT_ID` (MoE) | 86 | 16.5 | 39 % |
+| `CONCAT` | 374 | 2.0 | 5 % |
+| `RMS_NORM` | 365 | 0.8 | 2 % |
+| `MUL`, `ADD`, `SUM_ROWS`, `DIV`, `SQRT`, `REPEAT` | 1500 | 1.1 | 3 % |
+| total timed | | 42.7 | |
+
+Largest single signatures: the MoE at 16.5 ms (86 nodes, `ne=[2048,6,6,1]`), the MLA output
+projections at 6.8 ms (`ne=[32768,6,1,1]`, 43 nodes) and 6.7 ms (`ne=[1024,6,8,1]`, 43 nodes), and the
+lm head at 2.3 ms for its single node. 2434 of the 5208 nodes have no timing line in the replay (cases
+test-backend-ops skips or that this join does not parse), so 42.7 ms is a lower bound.
+
+What it says for kernel work: 91 % of the measured pass is in two families, and both are already near
+this part's memory system. The dense projections run at 205 to 220 GB/s of the 232 GB/s the pair
+reaches at a five-token batch, and the MoE's marginal cost is 8.75 ms per extra token against
+1.6 GiB per node, which is 196 GB/s. So the 1.75x to the reference is not sitting in these kernels,
+and a kernel-only campaign with this shape of work has on the order of 10 to 15 % in it, not 75 %.
+
+The 42.7 ms is also 3x under the 125 ms a real pass costs, which is the L2 inflation of the replay
+method plus the untimed nodes; it must not be read as a measurement of pass time. It is a share
+measurement, and it narrows the sentence above: with both GPUs drawing 44 W through a pass
+(`bench/deepseek-v4-tp-coordination.txt`), the pass is not coordination-bound either, so its 125 ms is
+kernel time running at roughly half the bandwidth these same tensors reach when measured alone. That
+small-batch gap is the one place left where a kernel change can pay, and it is a kernel and batch-shape
+problem rather than a protocol one.
+
+--- 2026-09-14, the same graph at one token: what is weight-bound and what is not ---
+
+Exported and replayed twice, `-np 6` and `-np 1`, same tool path, no model load:
+
+| family | 1 token | 6 tokens | ratio |
+|---|---|---|---|
+| `MUL_MAT` (dense) | 18.5 ms | 22.3 ms | 1.2x |
+| `MUL_MAT_ID` (MoE) | 8.2 ms | 16.5 ms | 2.0x |
+| all families | 28.8 ms | 42.7 ms | 1.5x |
+
+Per signature, the split is sharp. The MLA output projections (`ne=[32768,.,1,1]`, 43 nodes) cost
+6.2 ms at one token and 6.8 ms at six; the grouped attention input (`ne=[1024,.,8,1]`, 43 nodes) 6.2
+against 6.7 ms; the lm head 2.2 against 2.3 ms. Six times the tokens cost these 8 to 10 %, because
+their weights are read once per pass whatever the batch carries. The MoE is the only family that
+tracks the batch: 5.3 ms at one token against 16.5 ms at six, and even that is sub-linear, 3.1x for
+6x the tokens, because a batch's tokens share experts.
+
+That is the shape of the fixed cost this arm pays on every pass: reading the dense weights, 5.25 GiB
+of the 10.4 GiB a token touches, once per pass and independent of how many tokens the pass verifies.
+At 4.50 accepted tokens per pass that is 18 to 22 ms of every pass spent on bytes that do not change
+with the batch, which is why the arm's c1 rate sits where it does and why the single-Spark 2.72 bpw
+arm is only 10 % ahead despite reading 40 % fewer bytes: the dense share of its traffic is also
+per-pass rather than per-token, and its MoE share is already shared across the batch.
+
+--- 2026-09-14, how the dense-bytes lever could be exercised, and what is not known about it ---
+
+The measurement above says the largest share of the replay budget belongs to the dense read, and its
+size is set by the quant: 7.15 GiB of the file's 144.44 GiB is Q8_0, but those tensors are read in full
+on every pass while only 6 of 256 experts are, which makes them about 70 % of the per-token bytes. So
+the lever with the largest measured term is quantizing those tensors to 4 bits while leaving the MXFP4
+experts alone, and `tools/quantize` can express that: `--tensor-type-file` maps per-tensor-name
+patterns to types through `parse_ggml_type`, and the option table carries `MXFP4_MOE`
+(`LLAMA_FTYPE_MOSTLY_MXFP4_MOE`, tools/quantize/quantize.cpp:39).
+
+Three things are not established and would need checking before a run is worth its hour of machine
+time. Whether the option table's MXFP4_MOE entry has a dedicated per-tensor assignment in the type
+selection switch, or falls through to a default. Whether tensors already at the target type are copied
+verbatim rather than round-tripped through F32, which decides whether the 137 GiB of experts come out
+of the requantize unchanged or with a second generation of quantization noise. And what the Q8_0 to
+4-bit change costs in quality on the attention projections, which the two greedy gates in
+`scripts/bench-spark.py` are far too weak to measure.
+
+Deliberately not run: it changes the served artifact rather than the engine, the quality cost is
+unmeasured, and it is a model-level change rather than a llama.cpp one. Recorded here so the decision
+is a decision with numbers attached rather than an open question.
+
+--- 2026-09-14, the MMVQ parameter table is not a lever either ---
+
+The dense and MoE matvecs at this batch size run on MMVQ, and MMVQ takes its launch parameters from a
+per-architecture table. This pair is a GB10, which has its own (`MMVQ_PARAMETERS_GB10`, selected in
+`get_device_table_id` in `ggml/src/ggml-cuda/mmvq.cu`). `patches/0005` is exactly this kind of work for
+RDNA3 single-token dispatch, so the table was worth one cheap test. Made switchable at runtime
+(`GGML_MMVQ_TABLE=<index>`, a local change, reverted after) and two tables measured on the real shapes,
+same replay path, no model load:
+
+| op | device table (GB10) | table 1 (TURING) |
+|---|---|---|
+| `attn_wo_a` q8_0, six tokens, 43 nodes | 161.1 us | 155.3 us |
+| `ffn_moe_gate` mxfp4, 6 of 256, six tokens | 189.5 us | 193.8 us |
+
+Mixed signs at 2 to 4 %, so the parameter table is not where the small-batch gap lives and is not worth
+a 17-minute load to chase. Reverted; `mmvq.cu` matches the published source on all three trees
+(md5 `dfb59c554303602b3e284309259f2ae1`).
+
+--- 2026-09-14, the requantize was built and served: no gain, and the output changes ---
+
+The lever above was run, with the user's go-ahead. Recipe, verified with `--dry-run` first:
+`llama-quantize --allow-requantize --tensor-type-file tt.txt <UD-Q4_K_XL shard 1> all4bit.gguf Q4_K 20`
+where `tt.txt` maps `ffn_gate_exps`, `ffn_up_exps` and `ffn_down_exps` to `mxfp4` so the experts keep
+their format and only the dense tensors drop. The dry run confirmed the assignment: experts unchanged
+at mxfp4, attention and shared-expert tensors from q8_0 to q4_K (a few upgraded to q6_K by the k-quant
+mixture). Model 147905 MiB (4.36 BPW) to 144517 MiB (4.26 BPW), and the whole file went from 144.44 GiB
+to 141.1 GiB in 2.7 minutes of quantize, because the already-mxfp4 experts are copied rather than
+round-tripped.
+
+Measured on the same configuration as the best c1 arm (two slots, f16 KV, DSpark):
+
+| c1, three reps | median | range | spread |
+|---|---|---|---|
+| UD-Q4_K_XL (q8_0 dense) | 40.4 (two runs) | 39.0 - 41.1 | 3 - 5 % |
+| all4bit (q4_K dense) | 40.9 | 40.3 - 40.9 | 1.5 % |
+
+So about 1 %, inside the spread, for 28 % fewer weight bytes per token. That is the small-batch
+latency finding confirmed from the other direction: at one to six tokens per pass this engine is
+limited by latency, not by the bytes it moves, so halving the dense traffic buys nothing measurable.
+
+And it is not free. The greedy gate changed: `gate_9x8` still answers `72, 9x9`, but `gate_france`
+answers ` Paris.", "The capital of` where both the reference and the q8_0 model answer
+` Paris. The capital of Spain`. One gate is a weak test, but it is the test this repo uses, and it moved.
+
+Verdict: not adopted. The artifact stays UD-Q4_K_XL. The recipe and the result are recorded so that the
+byte-shaped lever is closed with a measurement rather than with an argument, and `all4bit.gguf` is kept
+on spark1 (141.1 GiB) in case a long-context test ever wants it, where the bytes would matter more.
+
+--- 2026-09-14, reconciling the two nulls: dense is latency-limited, MoE is byte-limited ---
+
+Two measurements that looked contradictory and are not. The requantise took 28 % off the per-token
+weight bytes for about 1 % of throughput (section above), which says the pass is not byte-limited. The
+same graph exported at one token instead of six costs 28.8 ms against 42.7 ms, which says the pass does
+scale with something the batch carries.
+
+The batch carries two different things. The dense projections are read once per pass whatever the batch
+holds, and their cost is unchanged by removing their bytes, so they are limited by latency rather than
+by bandwidth: the replay puts the dense family at 22.3 ms for six tokens and 18.5 ms for one, while
+their traffic at 232 GB/s is about 11 ms per node. That is roughly 2x off the memory system with the
+bytes already paid for. The MoE is the opposite: its traffic grows with the batch because each token
+brings its own experts, and it moves those bytes at 196 GB/s per node, which is 84 % of what the part
+reaches.
+
+So the arithmetic for a pass is one latency-limited family and one bandwidth-limited family, and the
+levers are correspondingly different. For the MoE, fewer bytes per expert or fewer experts per token
+(the requantise did not touch it, which is why it showed almost nothing). For the dense family, the fix
+is latency: fewer ops, fused ops, or more memory-level parallelism inside the existing kernels, and the
+op budget already says 91 % of its time is in two families that cannot be made much cheaper per byte.
+
+One caveat that has to be checked before anyone acts on the dense number: the replay times one
+occurrence of each signature as its own graph launch, so its per-op floor near 10 us may be an artefact
+of the method rather than a property of the kernel. A dense kernel that takes 10 us under the replay and
+0.2 us inside the real graph would make the dense family bandwidth-bound after all, and the requantise
+null would then need another explanation.

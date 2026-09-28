@@ -1,0 +1,426 @@
+Tensor-parallel DeepSeek-V4-Flash-0731 across the two Sparks, with the RPC server's subgraph
+dispatch made asynchronous. 4-bit weights throughout (UD-Q4_K_XL), the same model the two-node
+layer-split records use.
+
+Why this target: with 4-bit weights the two-node layer split has a floor of about 33 tok/s, because
+each node reads its half of the layers *in series* and a token costs one node's full pass over the
+6 GB of active weights. Neither smaller quants nor serving flags move that. Only running both nodes on
+the same token does, and the reason tensor parallelism has been losing here is the cost of doing so.
+
+--- the cost that was measured ---
+
+A tensor-parallel token on this fork is split into ~92 subgraphs, and the fork runs one cross-node
+NCCL allreduce after each of them. The RPC server's own counters, from a 32-token run:
+
+    [~rpc_server] connection stats: graph_compute: 348, graph_recompute: 2610, post_allreduce: 2924
+
+2924 collectives for 32 tokens is 91 per token. The client takes a blocking collective after each
+subgraph, so anything the server does between receiving a subgraph and joining that collective lands
+directly on the critical path. It was doing two things there: calling the *synchronous*
+`ggml_backend_graph_compute()` (which synchronises the backend before returning) and therefore only
+reading the next request once the previous subgraph had finished on the GPU.
+
+--- the change ---
+
+`ggml/src/ggml-rpc/ggml-rpc.cpp`, eleven edits:
+
+- `rpc_server::graph_compute()` and `rpc_server::graph_recompute()` submit with
+  `ggml_backend_graph_compute_async()` instead of the synchronous wrapper, so the server can read and
+  dispatch the next subgraph while the GPU still works on the previous one;
+- a file-static `rpc_sync_backends()` is called at the top of the eight handlers that read or write
+  backend memory, which is where the synchronisation is actually needed: `free_buffer`,
+  `buffer_clear`, `memset_tensor`, `set_tensor`, `init_tensor`, `get_tensor`, `copy_tensor`,
+  `nccl_world_free`;
+- the post-compute allreduce needs no extra sync: it is enqueued on the same stream as the graph it
+  follows, so it is already ordered after those kernels.
+
+Current state of the change: applied and built in the Spark build trees (`spark1:~/llamacpp-nccl`,
+`spark2:~/llamacpp-nccl`), not committed to the fork, and reproducible with
+`.scratch/patch-async-server.py` in the workspace. It is a server-side change only; the client, the
+RPC wire format, and the patch series are untouched.
+
+--- measurements ---
+
+`llama-cli`, tensor split over RPC, `-ngl 999 -fa on -ctk f16 -ctv f16 --ctx-size 2048 --no-warmup`,
+prompt "What is 2+2? Answer with just the number.":
+
+| configuration | before (recorded, prior session) | after (2026-09-14) |
+|---|---|---|
+| tensor parallel, no draft, `-n 128` | 12.8 tok/s | **20.6 tok/s** (+61 %) |
+| tensor parallel + DSpark, `-n 64` | 21.9 tok/s | **27.5 tok/s** (+26 %) |
+
+Both produce the correct answer (`2+2=4`, then `4`). The "before" column is the recorded tensor-parallel
+number for the same fork and the same flags, not a same-day measurement: at 20 minutes per model load
+a same-day A/B is the next check, and until it is run the percentages should be read as directional.
+
+For the first time on this rig the tensor-parallel arm beats the layer-split arm at c1: 27.5 against
+24.8 tok/s, with the same 4-bit weights.
+
+--- the layer-split path with the same server change ---
+
+Seven passes of the published layer-split configuration (`-c 4096`, DSpark, `-np` default), golden chat
+workload at c1, against the async server: 21.7 / 21.8 / 26.6 / 24.0 / 26.7 / 26.6 / 24.2, median 24.2,
+spread 21.7-26.7. The published medians for the same configuration on the synchronous server are 24.8
+and 25.3. That is inside the spread, so there is no clear change either way on this path, and the
+gates still match the reference harness exactly (` Paris. The capital of Spain`, `72, 9x9`).
+
+That is consistent with the change: in the layer split the client needs the server's output data after
+each subgraph anyway, so its `get_tensor` forces the same synchronisation the server used to do itself.
+
+--- what this says about the remaining gap ---
+
+At 27.5 tok/s the tensor-parallel arm is still 2.3x short of the reference's 63.1 at c1, and the
+coordination is still ~92 collectives per pass. The change removed the host serialisation around them;
+what remains is the collective latency itself and the per-subgraph bookkeeping. The next steps in the
+same direction:
+
+- make the collectives overlap the compute instead of sitting between subgraphs, or reduce their count
+  by splitting fewer tensors;
+- then repeat the layer-split regression check with more passes, and re-measure the tensor-parallel
+  baselines on the same day, on the unpatched build, so the percentages are exact.
+
+--- where the remaining time goes: the collective priced, and a negative result ---
+
+Two more experiments on the same asynchronous build, no-spec tensor parallel, `-n 128`, same flags,
+so the comparison is same-build:
+
+| configuration | generation |
+|---|---|
+| asynchronous server, real collectives | 20.6 tok/s |
+| asynchronous server, collectives made no-ops | **24.6 tok/s** |
+
+The no-op is env-gated (`GGML_NCCL_NOOP_ALLREDUCE=1`, `.scratch/patch-noop-allreduce.py`): the ranks
+skip `ncclAllReduce`, the partial sums are never combined and the output is wrong, but the time a token
+then takes is the floor any collective implementation could reach. Free collectives buy 19 %, so the
+collectives are ~9 ms of the 48.5 ms a token costs, and the rest is elsewhere.
+
+The server's counters for that run:
+
+    [~rpc_server] connection stats: graph_compute: 348, graph_recompute: 10962, post_allreduce: 11180
+
+11180 collectives and 11310 graph executions for 128 tokens, so ~88 subgraphs and ~87 collectives per
+token. At the no-op ceiling a token costs 40.6 ms, of which each node's own compute is about 15 ms
+(half the layers over 3.1 GB of active weights each). The other ~25 ms is per-subgraph host and launch
+work, roughly 0.28 ms per subgraph, since 88 of them are submitted per token. That, not the collective,
+is now the largest single overhead on this path.
+
+A second change tested that hypothesis on the client side and produced a negative result:
+`ggml_backend_rpc_comm_allreduce_tensor` uses `std::async` to launch the local rank, so every
+collective pays a thread create and join. Launching inline (`.scratch/patch-inline-allreduce.py`)
+measured 19.6 tok/s against the 20.6 baseline, i.e. neutral to slightly worse, so the thread was
+overlapping the launch with the client's other work rather than wasting time. Reverted, and the tree
+is back to the asynchronous-server change alone.
+
+Next, in order: cut the per-subgraph host cost (the client's submission path and the server's request
+path are the two candidates, neither measured separately yet), or reduce the subgraph count itself,
+which is the split planner's choice of how many tensors are marked for splitting.
+
+--- who is the pipe: CPU sampled on both nodes during a decode ---
+
+Method: /proc utime+stime for the exact process name, sampled once a second on each node during a
+tensor-parallel run (`pgrep -x`, because a pattern that also appears in the sampler's own command line
+silently samples the sampler; the first attempt did exactly that and produced 0.08 ms/token, which is
+why it is written down here).
+
+Tensor parallel with DSpark, `-n 128`, 29.6 tok/s (the same build measured 27.5 on the previous run, so
+this path has a run-to-run spread near 8 %):
+
+| | CPU during the decode |
+|---|---|
+| client (llama-cli) | ~1 core, ~35 ms of CPU per token |
+| server (ggml-rpc-server) | ~1 core, ~35 ms of CPU per token |
+
+A token takes 34 ms. So both hosts run flat out while the GPUs, which have the work in hand, wait: the
+same pattern as the layer-split arm, one level down. That is consistent with what the earlier numbers
+implied from two directions: the asynchronous server change (which removed host serialisation per
+subgraph) was worth +61 % without a draft, while making the collective itself free was only worth +19 %.
+The pipes on both ends, not the collective, are the cost.
+
+Both nodes were near 1.0 s/s for the whole decode, so this is a throughput limit of the per-subgraph
+host path, not a burst. With roughly 88 subgraphs per decode and three decodes per speculative pass
+(target verify, draft KV sync, draft block propose) the client's host budget works out at a few tenths
+of a millisecond per subgraph, which is the number to attack.
+
+Next: instrument the client's per-subgraph path directly (the meta backend's loop, the CUDA subgraph
+launch, the RPC submission, the allreduce) with thread-CPU timers, the same way the layer split was
+attributed, and cut whichever stage dominates. The candidates, in the order they look from the code:
+CUDA graph lookup and launch per subgraph in `ggml_cuda_graph_compute` (88 of them per decode, each
+keyed by a graph pointer), the meta backend's per-subgraph bookkeeping, and the RPC message path.
+
+--- 2026-09-14: where the server's per-request time was going, and a real bug found ---
+
+Thread-CPU timers on the client's per-subgraph path (`ggml-backend-meta.cpp`, `ggml-cuda.cu`,
+`ggml-rpc.cpp`), tensor parallel with DSpark, dumped every 8 decodes:
+
+| stage | cumulative | steady state (between the last two dumps) |
+|---|---|---|
+| meta graph_compute, per decode | 19-23 ms | **2.5 ms** |
+| . launch both backends, per subgraph | 0.26-0.32 ms | 0.018 ms |
+| .. cuda graph_compute | 0.36-0.43 ms | 0.028 ms |
+| .. rpc graph_compute | 0.17-0.20 ms | 0.007 ms |
+| . allreduce, per subgraph | 0.036-0.05 ms | 0.033 ms |
+
+The cumulative averages are dominated by graph construction during warmup; the steady state is two
+orders of magnitude cheaper than the first decodes, so the client's main thread is not the bottleneck
+(it is a few tenths of a core). The earlier /proc reading of "about one core per node" therefore
+reflects the warmup and the other threads, not this loop.
+
+The server, though, runs the same CUDA backend, and there the graph cache had a real defect. In
+`rpc_server::graph_compute` the uid arrives on the wire and is used to key `stored_graphs`, but it was
+never assigned to the graph, so `cgraph->uid` stayed 0 on the server. `ggml_cuda_graph_update_required`
+returns early only for `cgraph->uid != 0 && cgraph->uid == graph->uid`, so with 0 it fell through to a
+walk that memcpys a full `ggml_tensor` per node, plus each node's sources, and memcmps the result, on
+every launch. The client's graphs carry real uids, so only the server paid it, on every one of ~200
+requests per speculative pass.
+
+Fix, one line in `ggml/src/ggml-rpc/ggml-rpc.cpp`, reproducible with
+`.scratch/patch-server-graph-uid.py`: carry the wire uid onto the deserialized graph
+(`graph->uid = uid;` right after `ggml_new_graph_custom`).
+
+Measured effect: 30.9 tok/s with the fix against 27.5 and 29.6 for the same configuration without it,
+with correct output. That is at the top of the observed spread rather than clearly outside it, so the
+fix is certain as a code defect (the fast path was unreachable), while its throughput contribution
+needs more repetitions before it can be quoted. Run-to-run spread on this path is about 8 %, and every
+measurement here costs a 20-minute model load, so each A/B needs three runs to be believed.
+
+Both changes now in the Spark build trees, uncommitted and applied to both nodes: the asynchronous
+subgraph dispatch (`.scratch/patch-async-server.py`) and this uid carry
+(`.scratch/patch-server-graph-uid.py`).
+
+--- 2026-09-14: the uid fix, four runs, and which thread pays ---
+
+Tensor parallel with DSpark, `-n 128`, same flags, one run per line:
+
+| build | generation |
+|---|---|
+| asynchronous server, before the uid carry | 27.5 tok/s |
+| asynchronous server, before the uid carry | 29.6 tok/s |
+| asynchronous server, with the uid carry | 30.9 tok/s |
+| asynchronous server, with the uid carry | 35.4 tok/s |
+
+Medians 28.6 before and 33.2 after, so the uid carry looks like roughly +16 %. Two reps per arm is
+not enough to publish a percentage, but the direction matches the defect: the fast path was
+unreachable, so this is work removed rather than noise. A third run per arm is what it needs.
+
+Per-thread CPU on the server during the decode (`/proc/<pid>/task/*/stat` once a second, summed over
+the last contiguous busy stretch):
+
+| thread | CPU |
+|---|---|
+| main (`ggml-rpc-server`) | ~1.0 core for the whole decode |
+| three helper threads | ~0.07 core each |
+| `cuda-EvtHandlr`, `cuda0000...` | 0.00 |
+
+So the server's CPU is the request loop itself, not a polling or transport helper thread. With 1885
+graph requests over the run (493 misses, 1392 cache hits, 1828 allreduce-hook entries, from the
+server's own counters) that is of the order of 1 ms of CPU per request, and none of the stages
+measured so far accounts for it: the socket read, the map lookup, the CUDA graph launch and the
+allreduce hook should together be tens of microseconds, not a millisecond.
+
+Next: thread-CPU timers on exactly those four stages in the server's request path
+(`.scratch/patch-prof6.py` is written for it), which is the last unmeasured part of the path on
+either node.
+
+--- 2026-09-14: the server's request path is cheap; the previous inference was wrong ---
+
+Thread-CPU timers on the server's request path (socket read, handler, graph submit, allreduce hook),
+tensor parallel with DSpark, dumped every 512 handled requests and again at client disconnect:
+
+| stage | ms per request |
+|---|---|
+| socket read | 0.004 |
+| handler (lookup + submit) | 0.040 |
+| . graph submit | 0.031 |
+| . allreduce hook | 0.008 |
+
+So a graph request costs the server about **44 us**, and the server's counters put the run at 1695
+graph requests for 128 tokens (~63 per speculative pass), i.e. under 3 ms of server CPU per pass. The
+earlier reading, from `/proc` sampled once a second, that the server ran at "about one core" and the
+inference that followed from it, "order 1 ms of CPU per request", were both wrong: the one-second
+window could not separate the model load (receiving and uploading half the weights, which is what the
+server's main thread is really busy with) from the roughly four seconds of decode that follow it. The
+record is corrected here rather than left standing.
+
+With both hosts' request paths now measured and cheap (client ~2.5 ms per decode in steady state,
+server 44 us per request), the picture for a speculative pass at ~33 tok/s is:
+
+| | per pass |
+|---|---|
+| GPU compute, both nodes in parallel (5 verified tokens, ~15.5 GB per node at the layer split's measured ~209 GB/s) | ~74 ms |
+| cross-node collectives (~63 per pass, paid once per subgraph) | ~10-20 ms |
+| client request path (3 decodes at 2.5 ms) | ~8 ms |
+| server request path (63 requests at 44 us) | ~3 ms |
+
+against the ~142 ms a pass actually takes at 33 tok/s. So the wall is the GPU work, and the measured
+coordination is roughly a quarter on top of it, not the other way round. The 74 ms figure is the
+optimistic case: it borrows the layer split's per-node bandwidth, and tensor parallelism halves every
+matrix, so the real per-node rate here is probably lower. That is the next thing to measure, with
+llama-bench in tensor-parallel mode, because it decides whether this path can approach the reference's
+15.9 ms per token at all.
+
+--- 2026-09-14: what the tensor-parallel path can actually reach ---
+
+`llama-bench`, 4-bit `UD-Q4_K_XL`, tensor parallel over RPC, one rep:
+
+| test | single Spark (recorded) | tensor parallel |
+|---|---|---|
+| pp512 | 378.95 t/s | **757.60 t/s** |
+| tg32 | 20.51 t/s | **23.23 t/s** |
+
+Prefill scales exactly 2.0x, so splitting every matrix across the pair costs nothing in bandwidth
+when the batch is large: both nodes are working, and each reads half the weights. Decode barely moves,
++13 % rather than 2x, and that is the same effect already measured on one node: at one token per pass
+the matvec runs at about 79 GB/s against 165 GB/s at five tokens, because a single token does not
+produce enough parallelism to hide memory latency. Halving the bytes does not help a step that is
+latency-bound rather than bandwidth-bound.
+
+That sets this path's ceiling from the measured numbers rather than from a model:
+
+| | per pass (5 verified tokens) |
+|---|---|
+| per node, 15.5 GB at 165 GB/s (the measured rate at this batch size) | ~94 ms |
+| per node, 15.5 GB at 209 GB/s (the best rate seen anywhere on this rig) | ~74 ms |
+| what the reference needs (63.1 t/s at 4.69 tokens per pass) | 74 ms |
+
+So tensor parallel plus DSpark, with the batch-5 bandwidth this engine currently reaches, tops out
+around 50 tok/s, and reaching the reference's 63.1 needs both the coordination overhead (about a
+quarter of the pass) removed *and* the batch-5 bandwidth raised from 165 to above 200 GB/s.
+
+Both are engine work, and the second one is the same small-batch latency problem the single-node arm
+showed: at five tokens per pass the matvecs are still well short of what the hardware can do.
+
+--- 2026-09-14: are the GPUs saturated during a tensor-parallel pass? ---
+
+`nvidia-smi dmon -s pucm` on both nodes, once a second, while the tensor-parallel DSpark
+configuration ran at 29.6 tok/s. Coarse: the decode is about 4 s long and the sampler is 1 Hz, so the
+window it resolves is 1-2 s and this should not be read as a precise figure.
+
+| node | mean SM in the last active stretch | peak | mean power |
+|---|---|---|---|
+| client (spark1) | ~50 % | 50 % | 15 W |
+| server (spark2) | ~68 % | 81 % | 30 W |
+
+Neither GPU is saturated and neither is near the part's power ceiling, so the pass is not compute-bound
+in the way a large-batch pass is: it is waiting somewhere. That matches the arithmetic above, where the
+measured coordination is about a quarter of the pass and the batch-5 bandwidth is well short of what
+the same hardware reaches on the layer split.
+
+A cleaner attribution would need a profile short enough to capture only the decode; the earlier
+attempt on this path produced a 1.5 GB trace covering the whole model load, and nsys on this rig offers
+no delay-before-capture option, so that is left open rather than guessed at.
+
+--- the two changes, as a reviewable diff ---
+
+Both changes are one file, `ggml/src/ggml-rpc/ggml-rpc.cpp`, +19/-2, and live in the fork's working
+tree at `/home/maci/Desktop/llamacpp-nccl` (branch `unmerged-prs`, uncommitted) as well as in both
+Spark build trees, which are byte-identical to it:
+
+- `rpc_server::graph_compute` and `rpc_server::graph_recompute` submit with
+  `ggml_backend_graph_compute_async()` instead of the synchronous wrapper, and a new
+  `rpc_sync_backends()` is called at the top of the eight handlers that read or write backend memory
+  (`free_buffer`, `buffer_clear`, `memset_tensor`, `set_tensor`, `init_tensor`, `get_tensor`,
+  `copy_tensor`, `nccl_world_free`). The post-compute allreduce needs no extra sync: it is enqueued on
+  the same stream as the graph it follows;
+- in `graph_compute`, `graph->uid = uid;` after `ggml_new_graph_custom`, carrying the uid that arrives
+  on the wire onto the graph so the CUDA backend's graph cache can take its fast path.
+
+Measured on 4-bit `UD_Q4_K_XL`, tensor parallel with DSpark, `-n 128`: 12.8 -> 20.6 tok/s without the
+draft and 21.9 -> 27.5..35.4 with it, the last step being the uid carry (two runs either side:
+27.5 / 29.6 before, 30.9 / 35.4 after).
+
+--- comparability with the reference's generation length ---
+
+Every tensor-parallel number above was taken with `-n 128`. The reference bar of 63.1 tok/s at c1 is a
+512-token generation, so the same configuration was run at `-n 512 -c 2048`:
+
+    30.2 tok/s generation, 18.5 tok/s prompt, correct output (2+2=4)
+
+against 27.5 / 29.6 / 30.9 / 35.4 for the five 128-token runs on the same build. The number does not
+drift with generation length, so the comparison with the reference's 63.1 at c1 is like for like on
+prompt and generation length, if not on quant (this is 2.72 bits per weight against the reference's
+roughly 4.5, and the 4-bit arm's own numbers are 27.5-35.4).
+
+--- 2026-09-14: three reps per arm, and two corrections to this record ---
+
+Same configuration, `-n 128`, tensor parallel with DSpark, alternating between the two builds:
+
+| arm | runs | median | spread |
+|---|---|---|---|
+| before the uid carry | 27.5 / 29.6 / 30.0 | 29.6 | 27.5-30.0 (+-4 %) |
+| with the uid carry | 30.9 / 35.4 / 22.4 | 30.9 | 22.4-35.4 (+-30 %) |
+
+The earlier claim in this file, "roughly +16 %", does not survive three reps an arm. The uid fix is
+certain as a *code* defect: the fast path in `ggml_cuda_graph_update_required` is unreachable when
+`cgraph->uid == 0`, and the server's deserialized graphs had exactly that. What is not established is
+how much throughput it buys, because the rig's run-to-run variation on this path (27.5 to 35.4 across
+six runs of two builds) is as large as the effect.
+
+Two things behind that variation, both worth recording:
+
+- the third run with the uid carry came in at 22.4 tok/s, 27 % below its siblings, with no other load
+  visible on either node (no containers, no bench running, load average under 1) and no RDMA retry
+  errors in the server log. It is an unexplained outlier, not a measurement;
+- the server's `connection stats` line cannot be read as a per-run total. Across four runs of the same
+  configuration it reports 745, 840, 1695 and 2075 graph requests, and where it was cross-checked
+  against a process-wide counter the two agreed, so the line is per connection and the client opens
+  twelve of them per run. That means the "~88 subgraphs per token" figure used earlier in this file,
+  and inherited from the session notes as "~106 allreduces per token", are not safe per-token counts:
+  they are per-connection sums of a quantity that varies 3x between identical runs.
+
+Neither correction changes the ceiling arithmetic, which is built from timing and byte counts rather
+than from request counts.
+
+Environment note: spark2 has rebooted during this session (uptime 5:56 at the time of these runs,
+against spark1's 1 day 15 h), and the rig is shared with the vLLM project, so long single-run A/Bs on
+this path should be treated as indicative only.
+
+--- the harness, verified ---
+
+Every number in the DeepSeek records came from an ad-hoc script in the workspace scratch directory,
+which this project's conventions treat as disposable. `scripts/bench-spark.py` is that harness, in the
+repo, with the thing the records actually needed: `--reps` passes per level reported as a median with
+its range, because one pass on this rig swings by tens of percent.
+
+Verified against a running server before being recorded here, single-Spark `UD-Q2_K_XL` with DSpark,
+one pass per level:
+
+    gate_france: ' Paris. The capital of France'
+    gate_9x8: '72, 8x9'
+    c1   median=39.3 tok/s
+    c3   median=60.3 tok/s
+
+which reproduces the recorded 38.8 and 64.2 for that arm within its spread, and the gates match the
+reference harness byte for byte (leading space included, which is why the harness no longer strips the
+text).
+
+--- 2026-09-14: the batch-5 bandwidth in both split modes, same 4-bit model ---
+
+`llama-bench`, `UD-Q4_K_XL`, `-p 5,16,64 -n 32 -r 2`, both nodes in both cases:
+
+| test | layer split | tensor parallel | ratio |
+|---|---|---|---|
+| pp5 | 37.39 +- 5.46 | 64.03 +- 2.98 | 1.71x |
+| pp16 | 78.05 +- 1.74 | 125.22 +- 5.40 | 1.60x |
+| pp64 | 174.04 +- 4.04 | 250.52 +- 5.00 | 1.44x |
+| tg32 | 16.70 +- 0.26 | 23.02 +- 0.83 | 1.38x |
+| pp512 (earlier) | 378.95 | 757.60 | 2.00x |
+
+Read as per-node bandwidth for the pass size that matters:
+
+| split | per-node bytes per 5-token pass | pass time | per-node rate |
+|---|---|---|---|
+| layer | 15.5 GB, the two halves in series | 134 ms | ~232 GB/s |
+| tensor | 15.5 GB, both halves at once | 78 ms | **~199 GB/s** |
+
+So tensor parallel reaches 86 % of the layer split's per-node rate at five tokens and closes to ~2x the
+prefill rate at 512, which means the split itself costs about 15-20 % at speculative batch sizes but is
+not the dominant problem. The dominant problem is what sits on top:
+
+    TP compute at batch 5  = 78 ms per pass  -> 60 tok/s ceiling
+    measured TP+DSpark     = ~30 tok/s       -> ~48 ms per pass of coordination
+
+Even with that coordination at zero, 60 tok/s is below the reference's 63.1. Beating the reference with
+this engine therefore needs the per-node rate at batch 5 to go past ~199 GB/s, past the ~232 GB/s the
+layer split already reaches and towards the part's 273 GB/s, *and* the coordination to fall to almost
+nothing. The reference implies roughly 230 GB/s per node with the collectives hidden; llama.cpp has not
+demonstrated that combination on this rig in any configuration measured here.

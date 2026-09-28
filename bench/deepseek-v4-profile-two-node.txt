@@ -1,0 +1,135 @@
+Nsight Systems profile of the two-node DeepSeek-V4-Flash-0731 decode, one capture per node.
+
+Setup: the same serve as bench/deepseek-v4-dspark-two-node.txt (UD-Q4_K_XL, 5 shards, layer split,
+-m / --rpc 10.0.1.2:50052 / -ngl 99 / -c 4096, draft dspark-...-BF16.gguf, --spec-type draft-dspark,
+--spec-draft-n-max 5), one 512-token generation on the golden chat workload, n_max 5.
+
+  spark1 (llama-server): nsys profile --cuda-graph-trace=node -o srv3 ./build/bin/llama-server ...
+  spark2 (ggml-rpc-server): nsys profile --cuda-graph-trace=node -o rpc3 ./build/bin/ggml-rpc-server ...
+
+--cuda-graph-trace=node is required, not optional: with the default mode the server's report contains
+no CUDA kernel data at all ("does not contain CUDA kernel data") and the client's report is a fraction
+of the run, because these builds run with CUDA graphs (USE_GRAPHS = 1) and the default records a graph
+as one activity instead of its nodes. The run under the profiler is 21.4 tok/s against 23-25 unprofiled,
+so the shape of the timeline is usable but the absolute numbers are not.
+
+--- what the pass costs ---
+
+116 passes for 512 tokens (4.41 generated per pass, the same acceptance as the unprofiled runs).
+
+| | client, spark1 | server, spark2 |
+|---|---|---|
+| decode window analysed | 22 s | 16 s |
+| GPU kernel time in window | 8.35 s | 6.78 s |
+| GPU busy (union of kernels) | 37.4 % | 41.1 % |
+| time inside cudaStreamSynchronize | 8.0 s | 6.35 s |
+| CUDA graph launches | 222 (2.0 / pass) | 166 (2.0 / pass) |
+| graph instantiations | 2 | 4 |
+
+So each node runs kernels for roughly 40 % of the wall clock and the two are serialised by the layer
+split: one pass is client compute, then server compute, then the draft again. Per pass that is about
+71 ms of client GPU and 78 ms of server GPU against a 190-206 ms pass, leaving 40-60 ms per pass in
+which neither node is executing.
+
+--- where the GPU time goes (client, 22 s window) ---
+
+| kernel | ms | % | calls | us/call |
+|---|---|---|---|---|
+| mul_mat_vec_q_moe<MXFP4, (int)2, true> | 3071.6 | 36.8 | 2415 | 1271.9 |
+| mul_mat_vec_q<Q8_0, (int)6> | 2183.4 | 26.1 | 27474 | 79.5 |
+| mul_mat_vec_q_moe<MXFP4, (int)2, false> | 1277.0 | 15.3 | 2415 | 528.8 |
+| mul_mat_vec_q<Q8_0, (int)5> | 292.3 | 3.5 | 115 | 2541.8 |
+| mul_mat_vec_f<bf16> | 230.1 | 2.8 | 575 | 400.2 |
+| concat_cont<uint> | 155.8 | 1.9 | 23920 | 6.5 |
+| mul_mat_f<bf16> | 144.5 | 1.7 | 1035 | 139.6 |
+
+The server's mix is the same shape (MXFP4 MoE 59 %, Q8_0 matvecs 24 %). The MXFP4 MoE matvecs are the
+whole story: 52 % of the client's GPU time, and the model is 137.06 GiB of MXFP4 out of 144.44 GiB.
+
+--- the arithmetic that matters ---
+
+Per verified token the pass reads about 6 GB of active weights (7 of 256 experts per layer, attention,
+and the Q8_0 output head). A layer split gives each node half the layers, and the halves run one after
+the other, so a token costs one pass over the full 6 GB no matter how many nodes are present. Measured:
+each node moves its half at 185-210 GB/s while it is executing, which is near the 273 GB/s peak of this
+part, and that is 30 ms per token. The pass then adds roughly 10 ms per token of non-GPU time.
+
+Consequences, all measured rather than modelled:
+
+- the layer split cannot beat about 33 tok/s on this model at any draft depth, because 6 GB per token
+  at the achievable per-node bandwidth is 30 ms and the reference bar needs 15.9 ms;
+- the draft is not the limit: acceptance is 68.6 % and 4.41 of the block's 5 tokens are taken, against
+  the reference's 4.70 per step;
+- the tensor-parallel path is the only one that would halve the per-token time, and it is worse here
+  (12.8 tok/s without a draft, 21.9 with it) because the per-layer allreduce over RoCE is not overlapped
+  with compute;
+- CUDA graph capture is not thrashing (2 instantiations in 22 s on the client), so the per-pass host
+  cost is not graph capture;
+- the RPC layer submits about 4 graph executions per pass (475 over 116 passes, graph_compute 249 /
+  graph_recompute 226), so about half of them miss the client's uid-keyed graph cache and are
+  re-serialised and rebuilt on the server.
+
+The draft costs two decodes per pass, one to sync its KV with the target's accepted tokens and one to
+propose the next block, and each is submitted across the RPC boundary like the target's, even though
+the draft is 3 blocks and 11 GiB.
+
+--- the host side: measured with timers, and the first reading was wrong ---
+
+CPU time sampled from /proc over one 512-token decode (21.8 s wall, 116 passes) looks alarming:
+
+| process | CPU time | share of wall | per pass |
+|---|---|---|---|
+| llama-server (spark1) | 18.5 s | 0.85 core | 160 ms |
+| ggml-rpc-server (spark2) | 22.2 s | 1.02 core | 191 ms |
+
+and per thread on the client two threads hold all of it: the inference thread at 9.56 s and the RPC
+dispatcher at 8.72 s. That reads as a host-bound decode, and it is not. The same run with thread-CPU
+timers in the decode loop (CLOCK_THREAD_CPUTIME_ID, temporary instrumentation, reverted after the run)
+splits it:
+
+| stage | ms CPU per call | calls per pass |
+|---|---|---|
+| target llama_decode | 4.8 | 1 |
+| target llama_synchronize | 65.7 | 1 |
+| spec process (draft KV sync) | 1.8 | 1 |
+| spec draft (propose) | 9.4 | 1 |
+| sample + accept | 1.0 | 1 |
+| inside llama_decode: pre-loop | 0.19 | 1 |
+| inside llama_decode: ubatch loop | 2.81 | 1 |
+| . of which process_ubatch | 2.52 | 1 |
+| . of which graph_compute (sched + rpc) | 2.28 | 1 |
+| . of which rpc serialize_graph (cache miss) | 0.08 | 2.1 |
+
+The 65.7 ms is in `llama_synchronize`, which is `cudaStreamSynchronize` on the CUDA backend
+(ggml/src/ggml-cuda/ggml-cuda.cu:2655) plus a condition-variable wait on the RPC backend. Waiting is
+not work: this driver spins while it waits for the stream, so the thread burns a core doing nothing.
+Real host work per pass on the client is about 17 ms, not 82 ms.
+
+The spin costs CPU and power, not throughput. It is left alone.
+
+--- what is left, re-derived ---
+
+Per pass, 168 ms of wall for 4.41 tokens:
+
+- client GPU busy ~62 ms, server GPU busy ~69 ms, strictly serialised by the layer split;
+- client host work ~17 ms;
+- the remaining ~20 ms is handoff and stall across the four graph submissions per pass.
+
+Per token that is 29.7 ms of GPU work, which for ~6 GB of active weights is ~200 GB/s per node while
+it executes, about three quarters of this part's 273 GB/s peak. Total GPU occupancy across the pair is
+78 % of the wall, but split between two nodes that cannot run at the same time.
+
+So the binding constraint is the serialised weight traffic of the layer split, not the host, and not
+the kernels. The host section above started from the /proc reading and drew the wrong conclusion; the
+numbers above are the corrected ones.
+
+Measured along the way:
+
+- `--spec-draft-device CUDA0` (draft pinned to the client, no cross-node draft) measured 25.1 / 27.2 /
+  24.0 tok/s over three passes against the 23.1 / 24.8 / 25.6 of the default, inside the run-to-run
+  spread, so it is not a fix;
+- the RPC graph cache misses on about half the submissions (457 compute / 434 recompute over 891
+  submissions in the 1024-token run) but a miss costs 0.08 ms of serialization, so it is not a target;
+- the draft's KV sync decode is flagged as an avoidable re-evaluation in the code itself, at the
+  [TAG_SPEC_AVOID_DRAFT_REEVAL] comment in tools/server/server-context.cpp, and at 1.8 ms per pass it is
+  not where the time is either.
